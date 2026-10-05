@@ -320,7 +320,6 @@ export class MastraTUI {
       this.state.editor.insertTextAtCursor?.('[image] ');
       flushRender(this.state);
     };
-    this.state.editor.getPromptAnimator = () => this.state.gradientAnimator;
 
     setupKeyboardShortcuts(this.state, {
       stop: () => this.stop(),
