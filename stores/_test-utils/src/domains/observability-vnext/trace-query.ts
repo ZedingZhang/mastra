@@ -1070,6 +1070,17 @@ const tableSummaryRange = { from: '2026-08-20T00:00:00Z', to: '2026-08-21T00:00:
 const tableSummaryStartedAt = (offsetMs: number) =>
   new Date(Date.parse(tableSummaryRange.from) + offsetMs).toISOString();
 
+/**
+ * The same instant as {@link tableSummaryStartedAt}, written in a zone offset instead of `Z`.
+ * A store that drops the offset reads the value hours away from where it belongs.
+ */
+const tableSummaryStartedAtInZone = (offsetMs: number, zoneMinutes: number) => {
+  const local = new Date(Date.parse(tableSummaryStartedAt(offsetMs)) + zoneMinutes * 60_000);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const zone = Math.abs(zoneMinutes);
+  return `${local.toISOString().slice(0, 23)}${zoneMinutes < 0 ? '-' : '+'}${pad(Math.floor(zone / 60))}:${pad(zone % 60)}`;
+};
+
 export const TRACE_QUERY_TABLE_SUMMARY_TIME_RANGE = tableSummaryRange;
 
 const summaryMetric = (
@@ -1126,7 +1137,13 @@ export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
       spanType: 'model_generation',
       startedAt: tableSummaryStartedAt(100),
       endedAt: tableSummaryStartedAt(1500),
-      attributes: { model: 'gpt-5', provider: 'openai', completionStartTime: tableSummaryStartedAt(520) },
+      // Written in +05:30 rather than UTC: the first-token time is the same instant, and a store
+      // that drops the offset reports hours instead of the 420 ms the other stores report.
+      attributes: {
+        model: 'gpt-5',
+        provider: 'openai',
+        completionStartTime: tableSummaryStartedAtInZone(520, 330),
+      },
     }),
     span(4, 'summary-a', 'model-a-2', {
       parentSpanId: 'root-a',
