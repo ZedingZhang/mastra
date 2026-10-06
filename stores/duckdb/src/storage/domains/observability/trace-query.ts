@@ -131,7 +131,7 @@ const TRACE_SELECT = `
 /** The table summary needs the root output and tags; other queries leave the blobs off the read path. */
 function traceSelect(plan: TrustedTraceQueryPlan): string {
   return plan.result === 'traces' && plan.tableSummary
-    ? `${TRACE_SELECT},\n  ${payloadColumnSql('r.output')} AS output,\n  r.tags AS tags`
+    ? `${TRACE_SELECT},\n  ${payloadColumnSql('r.output')} AS output,\n  r.tags AS tags,\n  r.error AS error`
     : TRACE_SELECT;
 }
 
@@ -930,7 +930,7 @@ export function compileDuckDBTableSummaryQueries(
       SELECT
         traceId,
         CASE WHEN json_type(attributes, '$.model') = 'VARCHAR' THEN json_extract_string(attributes, '$.model') END AS model,
-        ${durationMsSql('startedAt', `CASE WHEN regexp_matches(json_extract_string(attributes, '$.completionStartTime'), ?) THEN TRY_CAST(json_extract_string(attributes, '$.completionStartTime') AS TIMESTAMP) END`)} AS timeToFirstTokenMs,
+        ${durationMsSql('startedAt', `CASE WHEN regexp_matches(json_extract_string(attributes, '$.completionStartTime'), ?) THEN TRY_CAST(json_extract_string(attributes, '$.completionStartTime') AS TIMESTAMPTZ) AT TIME ZONE 'UTC' END`)} AS timeToFirstTokenMs,
         row_number() OVER (PARTITION BY traceId ORDER BY startedAt ASC, spanId ASC) AS modelRank
       FROM current_spans
       WHERE spanType IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_MODEL_SPAN_TYPES)})
@@ -1094,6 +1094,7 @@ function traceRowToResult(row: Record<string, unknown>, summaries?: TableSummary
           tableSummary: coreStorage.buildTraceQueryTableSummary({
             output: row.output,
             tags: row.tags,
+            error: row.error,
             spans: rollup ?? null,
             feedback: summaries.feedback.get(traceId) ?? [],
             scores: summaries.scores.get(traceId) ?? [],

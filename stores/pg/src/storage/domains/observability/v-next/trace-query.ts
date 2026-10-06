@@ -135,7 +135,7 @@ const TRACE_SELECT = `
 /** The table summary needs the root output and tags; other queries leave the blobs off the read path. */
 function traceSelect(plan: TrustedTraceQueryPlan): string {
   return plan.result === 'traces' && plan.tableSummary
-    ? `${TRACE_SELECT},\n  r."output" AS "output",\n  r."tags" AS "tags"`
+    ? `${TRACE_SELECT},\n  r."output" AS "output",\n  r."tags" AS "tags",\n  r."error" AS "error"`
     : TRACE_SELECT;
 }
 
@@ -1190,6 +1190,7 @@ function traceRowToResult(row: Record<string, unknown>, summaries?: TableSummary
           tableSummary: coreStorage.buildTraceQueryTableSummary({
             output: row.output,
             tags: row.tags,
+            error: row.error,
             spans: rollup ?? null,
             feedback: summaries.feedback.get(traceId) ?? [],
             scores: summaries.scores.get(traceId) ?? [],

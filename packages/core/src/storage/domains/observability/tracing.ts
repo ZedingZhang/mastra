@@ -544,6 +544,36 @@ export function buildInputPreview(input: unknown, maxLength = INPUT_PREVIEW_MAX_
 /** Maximum length of the rendered `outputPreview` text. */
 export const OUTPUT_PREVIEW_MAX_LENGTH = INPUT_PREVIEW_MAX_LENGTH;
 
+/** The error text a Traces table row shows. */
+export const ERROR_PREVIEW_MAX_LENGTH = 200;
+
+/**
+ * Previews the error recorded on a span, as `name: message`, so a Traces table can say what
+ * went wrong instead of only that something did. The stack is never previewed.
+ *
+ * Accepts the stored error or its JSON string.
+ */
+export function buildErrorPreview(error: unknown, maxLength = ERROR_PREVIEW_MAX_LENGTH): string | undefined {
+  let value: unknown = error;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!value || typeof value !== 'object') return undefined;
+  const { message, name } = value as { message?: unknown; name?: unknown };
+  const text = typeof message === 'string' ? message.trim() : '';
+  if (!text) return undefined;
+  // A bare `Error` name says nothing the message does not, so only a real class is prefixed.
+  const label =
+    typeof name === 'string' && name.trim() && name.trim() !== 'Error' && !text.startsWith(name.trim())
+      ? `${name.trim()}: `
+      : '';
+  return truncatePreview(`${label}${text}`, maxLength);
+}
+
 /**
  * Builds the short text shown in a trace list's output column. Mirrors
  * `buildInputPreview`: accepts a parsed `output` value or its JSON string, previews

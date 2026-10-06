@@ -1100,7 +1100,7 @@ const summaryMetric = (
  * span, LLM and tool errors, tags, bounded feedback, more scores than the per-trace
  * limit, a rewritten score, and cache-token metrics including rows the projection must
  * ignore, a retried metric row, and a span whose clock runs behind the root's. `summary-b` is a
- * failed root with no related records. `summary-c` has an earliest model span without a model and
+ * failed root whose error carries a class and a stack. `summary-c` has an earliest model span without a model and
  * with an unparseable first-token time, a later complete one, rewritten feedback, and a feedback
  * record rewritten onto it from `summary-a`.
  */
@@ -1168,7 +1168,12 @@ export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
     span(8, 'summary-b', 'root-b', {
       startedAt: tableSummaryStartedAt(10_000),
       endedAt: tableSummaryStartedAt(11_000),
-      error: { message: 'agent crashed' },
+      // The error a Traces table shows: its class, its message, and a stack the preview drops.
+      error: {
+        message: 'The model `gpt-5` does not exist or you do not have access to it.',
+        name: 'AI_APICallError',
+        stack: 'AI_APICallError: The model `gpt-5` does not exist\n    at generate (agent.ts:1)',
+      },
     }),
     span(9, 'summary-c', 'root-c', {
       startedAt: tableSummaryStartedAt(20_000),
@@ -3268,6 +3273,7 @@ function evaluateTableSummary(
   return buildTraceQueryTableSummary({
     output: root.output ?? null,
     tags: root.tags,
+    error: root.error,
     spans: {
       errorTotal: traceSpans.filter(span => span.error !== null).length,
       errorLlm: traceSpans.filter(

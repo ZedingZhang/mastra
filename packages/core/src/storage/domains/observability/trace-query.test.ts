@@ -2010,6 +2010,8 @@ describe('table summary projection', () => {
     const summary = buildTraceQueryTableSummary({
       output: JSON.stringify({ text: 'The known interaction is with warfarin.', files: [] }),
       tags: '["production", 7, "needs-review"]',
+      error:
+        '{"message":"The model `gpt-5` does not exist.","name":"AI_APICallError","stack":"AI_APICallError: ...\\n at generate"}',
       spans: { errorTotal: 2, errorLlm: 1, errorTool: 1, model: 'gpt-5', timeToFirstTokenMs: 420.4 },
       feedback: overflow,
       scores: [],
@@ -2022,6 +2024,7 @@ describe('table summary projection', () => {
       tags: ['production', 'needs-review'],
       model: 'gpt-5',
       timeToFirstTokenMs: 420,
+      errorPreview: 'AI_APICallError: The model `gpt-5` does not exist.',
       errorCounts: { total: 2, llm: 1, tool: 1 },
       promptCacheReadTokens: 1200,
       promptCacheCreationTokens: null,
@@ -2040,7 +2043,15 @@ describe('table summary projection', () => {
         promptCacheReadTokens: 0,
         promptCacheCreationTokens: null,
       }),
-    ).toMatchObject({ outputPreview: null, tags: [], model: null, timeToFirstTokenMs: null, promptCacheReadTokens: 0 });
+    ).toMatchObject({
+      outputPreview: null,
+      tags: [],
+      model: null,
+      timeToFirstTokenMs: null,
+      promptCacheReadTokens: 0,
+      // A trace whose root did not fail has nothing to preview, even when a child span did.
+      errorPreview: null,
+    });
     expect(traceQueryTraceResponseSchema.safeParse({ traces: [], page: { next: null } }).success).toBe(true);
   });
 

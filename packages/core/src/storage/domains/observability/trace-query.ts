@@ -10,7 +10,7 @@ import {
   paginationInfoSchema,
 } from '../shared';
 import type { SpanRecord } from './tracing';
-import { buildOutputPreview } from './tracing';
+import { buildErrorPreview, buildOutputPreview } from './tracing';
 
 export const TRACE_QUERY_MAX_DEPTH = 12;
 export const TRACE_QUERY_MAX_NODES = 100;
@@ -503,6 +503,7 @@ export const traceQueryTableSummarySchema = z
     tags: z.array(z.string()),
     model: z.string().nullable(),
     timeToFirstTokenMs: z.number().int().nonnegative().nullable(),
+    errorPreview: z.string().nullable(),
     errorCounts: z
       .object({
         total: z.number().int().nonnegative(),
@@ -1332,6 +1333,8 @@ export interface TraceQueryTableSummaryInput {
   output: unknown;
   /** Root span tags, as an array or its stored JSON string. */
   tags: unknown;
+  /** Root span error, parsed or as its stored JSON string; absent when the root did not fail. */
+  error?: unknown;
   /** Rollup over the trace's current spans; omit when the trace has no current spans. */
   spans?: {
     errorTotal: number;
@@ -1379,6 +1382,7 @@ export function buildTraceQueryTableSummary(input: TraceQueryTableSummaryInput):
     tags: normalizeTags(input.tags),
     model: spans?.model ?? null,
     timeToFirstTokenMs,
+    errorPreview: buildErrorPreview(input.error) ?? null,
     errorCounts: {
       total: spans?.errorTotal ?? 0,
       llm: spans?.errorLlm ?? 0,
