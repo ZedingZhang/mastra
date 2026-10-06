@@ -978,7 +978,6 @@ export class KnowledgeLibSQL extends KnowledgeStorage {
     sourceId: string;
     targetId: string;
     sourceVersion: number;
-    targetVersion: number;
     importRunId?: string;
     contextScopeId?: string;
     expectedAccessEpoch?: number;
@@ -992,7 +991,6 @@ export class KnowledgeLibSQL extends KnowledgeStorage {
       sourceId: string;
       targetId: string;
       sourceVersion: number;
-      targetVersion: number;
       importRunId?: string;
       contextScopeId?: string;
       expectedAccessEpoch?: number;
@@ -1004,7 +1002,6 @@ export class KnowledgeLibSQL extends KnowledgeStorage {
     if (!source) throw new KnowledgeNotFoundError('node', input.sourceId);
     const target = await this.#getNode(tx, input.targetId);
     if (!target) throw new KnowledgeNotFoundError('node', input.targetId);
-    if (target.version !== input.targetVersion) throw new KnowledgeConflictError(input.targetId);
     const sourceScopeIds = await this.#getNodeScopeIds(tx, source.id);
     const now = new Date();
     const updated = await tx.execute({
@@ -1562,6 +1559,7 @@ export class KnowledgeLibSQL extends KnowledgeStorage {
   async deleteRecordBySource(input: {
     id: string;
     source: string;
+    version: number;
     importRunId?: string;
     expectedAccessEpoch?: number;
   }): Promise<KnowledgeRecord> {
@@ -2384,7 +2382,7 @@ export class KnowledgeLibSQL extends KnowledgeStorage {
       if (!mutation.kind || !mutation.mutation || typeof mutation.mutation !== 'object') {
         throw new Error(`Unsupported immutable payload for knowledge proposal ${proposal.id}`);
       }
-      if (proposal.operation !== mutation.kind) {
+      if (!input.verifiedMutation && proposal.operation !== mutation.kind) {
         throw new KnowledgeConflictError('Proposal operation does not match its payload');
       }
       assertKnowledgeProposalMutationSemantics(mutation, proposal.targets);
@@ -2737,7 +2735,7 @@ export class KnowledgeLibSQL extends KnowledgeStorage {
     return node;
   }
 
-  async #updateNode(executor: Transaction, input: UpdateKnowledgeNodeInput): Promise<KnowledgeNode> {
+  async #updateNode(executor: Executor, input: UpdateKnowledgeNodeInput): Promise<KnowledgeNode> {
     await this.#assertExpectedAccessEpoch(executor, input.expectedAccessEpoch);
     const existing = await this.#getNode(executor, input.id);
     if (!existing) throw new KnowledgeNotFoundError('node', input.id);
