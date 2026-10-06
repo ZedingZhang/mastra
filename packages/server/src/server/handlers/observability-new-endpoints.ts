@@ -99,7 +99,7 @@ import {
   assertObservabilityTraceQueryContextIdsSupported,
   assertObservabilityTraceQueryRootDurationSupported,
   isTraceQueryContextIdField,
-  assertObservabilityTraceQueryTableSummarySupported,
+  assertObservabilityTraceQuerySelectSupported,
   assertObservabilityTraceQuerySupported,
   createObservabilityListQuerySchema,
   getObservabilityStorageCapabilities,
@@ -314,6 +314,7 @@ export const QUERY_TRACES = createNewRoute(NEW_ROUTE_DEFS.QUERY_TRACES, {
     mode,
     after,
     limit,
+    select,
     include,
   }) => {
     let plan;
@@ -335,7 +336,7 @@ export const QUERY_TRACES = createNewRoute(NEW_ROUTE_DEFS.QUERY_TRACES, {
             })
           : undefined;
       plan = coreStorage.planTraceQuery(
-        { timeRange, where, group, orderBy, page, pagination, mode, after, limit, include },
+        { timeRange, where, group, orderBy, page, pagination, mode, after, limit, select, include },
         { authorizationBinding, scope: resolveTraceQueryScope(requestContext) },
       );
     } catch (error) {
@@ -357,7 +358,7 @@ export const QUERY_TRACES = createNewRoute(NEW_ROUTE_DEFS.QUERY_TRACES, {
       assertObservabilityTraceQuerySupported(observabilityStore);
       assertObservabilityTraceQueryRootDurationSupported(observabilityStore, plan.where);
       assertObservabilityTraceQueryContextIdsSupported(observabilityStore, plan.where);
-      assertObservabilityTraceQueryTableSummarySupported(observabilityStore, plan);
+      assertObservabilityTraceQuerySelectSupported(observabilityStore, plan);
       assertObservabilityTraceQueryTenantScopeSupported(observabilityStore, plan.scope);
       if (plan.paginationMode === 'delta' && !observabilityStore.getFeatures()?.includes('delta-polling')) {
         throw new HTTPException(501, { message: 'This storage provider does not support observability delta polling' });

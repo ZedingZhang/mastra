@@ -139,7 +139,7 @@ export type ObservabilityStorageFeature =
   | 'trace-aggregate'
   | 'trace-query-root-duration'
   | 'trace-query-discovery'
-  | 'trace-query-table-summary'
+  | 'trace-query-select'
   | 'thread-query'
   | 'trace-query-tenant-scope'
   | 'feedback'

@@ -154,11 +154,15 @@ const TRACE_PAGE_COLUMNS = [
   'status',
 ];
 
-/** The table summary needs the root output and tags; other queries leave the blobs off the read path. */
+/** Root-row columns the selected fields read; other queries leave the blobs off the read path. */
+function selectedRootColumns(plan: TrustedTraceQueryPlan): string[] {
+  if (plan.result !== 'traces') return [];
+  const needs = coreStorage.traceQuerySelectionNeeds(plan);
+  return (['output', 'tags', 'error'] as const).filter(column => needs[column]);
+}
+
 function traceSelect(plan: TrustedTraceQueryPlan): string {
-  return plan.result === 'traces' && plan.tableSummary
-    ? `${TRACE_SELECT},\n  r.output AS output,\n  r.tags AS tags,\n  r.error AS error`
-    : TRACE_SELECT;
+  return [TRACE_SELECT, ...selectedRootColumns(plan).map(column => `  r.${column} AS ${column}`)].join(',\n');
 }
 
 export class ParameterBuilder {
@@ -657,7 +661,7 @@ LIMIT ${limit}`,
  */
 export function compileClickHouseTraceRootPayloads(
   keys: Array<{ traceId: string; rootSpanId: string; startedAt: string; endedAt: string }>,
-  tableSummary = false,
+  columns: readonly string[] = [],
 ): CompiledClickHouseTraceQuery {
   const parameters = new ParameterBuilder();
   const tuples = keys.map(
@@ -665,7 +669,7 @@ export function compileClickHouseTraceRootPayloads(
       `(${parameters.add(key.startedAt, "DateTime64(3, 'UTC')")}, ${parameters.add(key.traceId, 'String')}, ${parameters.add(key.rootSpanId, 'String')}, ${parameters.add(key.endedAt, "DateTime64(3, 'UTC')")})`,
   );
   return {
-    query: `SELECT traceId, spanId AS rootSpanId, metadataRaw AS metadata, input${tableSummary ? ', output, tags, error' : ''}
+    query: `SELECT traceId, spanId AS rootSpanId, metadataRaw AS metadata, input${columns.map(column => `, ${column}`).join('')}
 FROM ${TABLE_TRACE_ROOTS}
 WHERE (startedAt, traceId, spanId, endedAt) IN (${tuples.join(', ')})
 LIMIT 1 BY traceId, spanId`,
@@ -878,37 +882,38 @@ export async function getTraceQueryValues(
   });
 }
 
-type TableSummaryRollup = NonNullable<coreStorage.TraceQueryTableSummaryInput['spans']> & {
-  promptCacheReadTokens: number | null;
-  promptCacheCreationTokens: number | null;
+type SelectionRollup = NonNullable<coreStorage.TraceQuerySelectionInput['spans']> & {
+  promptCacheReadTokens?: number | null;
+  promptCacheCreationTokens?: number | null;
 };
 
-interface TableSummaryRows {
-  rollups: Map<string, TableSummaryRollup>;
+interface SelectionRows {
+  rollups: Map<string, SelectionRollup>;
   feedback: Map<string, coreStorage.TraceQueryFeedbackSummary[]>;
   scores: Map<string, coreStorage.TraceQueryScoreSummary[]>;
 }
 
 /**
- * Bounded side queries for the selected page only. Each reads the same current-record
- * shape as the trace scope, restricted to the page's trace IDs, and never touches
- * ordering or totals: the page query already fixed them.
+ * Side queries for the selected page only, one per kind of field the request selected. Each reads
+ * the same current-record shape as the trace scope, restricted to the page's trace IDs, and never
+ * touches ordering or totals: the page query already fixed them.
  *
  * Spans and metrics start at `from`, a day before the requested window. A trace ID lookup
  * cannot prune on its own here: a day holds only a few index granules, so a page of trace IDs
- * touches all of them and every partition is read.
+ * touches all of them and every partition is read. There is no upper bound: a resumed workflow
+ * adds spans to its trace long after the trace started.
  */
-export function compileClickHouseTableSummaryQueries(
+export function compileClickHouseSelectionQueries(
   scope: TraceQueryTenantScope | undefined,
   traceIds: string[],
   from: string,
+  needs: coreStorage.TraceQuerySelectionNeeds,
 ): {
-  rollups: CompiledClickHouseTraceQuery;
-  feedback: CompiledClickHouseTraceQuery;
-  scores: CompiledClickHouseTraceQuery;
+  rollups?: CompiledClickHouseTraceQuery;
+  feedback?: CompiledClickHouseTraceQuery;
+  scores?: CompiledClickHouseTraceQuery;
 } {
   const list = (types: readonly string[]) => types.map(type => `'${type}'`).join(', ');
-  const relatedLimit = coreStorage.TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT + 1;
   // ClickHouse reads a backslash in a string literal as an escape, so the shared pattern doubles.
   const isoPattern = coreStorage.TRACE_QUERY_TIMESTAMP_PATTERN.replace(/\\/g, '\\\\');
   const compile = (build: (parameters: ParameterBuilder, ids: string, tenant: string) => string) => {
@@ -918,19 +923,29 @@ export function compileClickHouseTableSummaryQueries(
     return { query: build(parameters, ids, tenant), query_params: parameters.params };
   };
 
-  const rollups = compile((parameters, ids, tenant) => {
-    const read = parameters.add(coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheReadTokens, 'String');
-    const write = parameters.add(coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheCreationTokens, 'String');
+  const rollups = (parameters: ParameterBuilder, ids: string, tenant: string) => {
     const since = parameters.add(from, "DateTime64(3, 'UTC')");
-    return `WITH current_spans AS (
+    const ctes = [
+      `current_spans AS (
     SELECT traceId, spanId, spanType, error, startedAt, attributes
     FROM ${TABLE_SPAN_EVENTS}
     WHERE traceId IN ${ids}
       AND endedAt >= ${since}${tenant}
     ORDER BY dedupeKey
     LIMIT 1 BY dedupeKey
-  ),
-  model_spans AS (
+  )`,
+    ];
+    const columns = ['c.traceId AS traceId'];
+    const joins: string[] = [];
+    if (needs.errorCounts) {
+      columns.push(
+        'countIf(isNotNull(c.error)) AS errorTotal',
+        `countIf(isNotNull(c.error) AND c.spanType IN (${list(coreStorage.TRACE_QUERY_SELECT_LLM_SPAN_TYPES)})) AS errorLlm`,
+        `countIf(isNotNull(c.error) AND c.spanType IN (${list(coreStorage.TRACE_QUERY_SELECT_TOOL_SPAN_TYPES)})) AS errorTool`,
+      );
+    }
+    if (needs.model) {
+      ctes.push(`model_spans AS (
     SELECT traceId, tupleElement(earliest, 1) AS model, tupleElement(earliest, 2) AS timeToFirstTokenMs
     FROM (
       SELECT
@@ -945,11 +960,17 @@ export function compileClickHouseTableSummaryQueries(
           (startedAt, spanId)
         ) AS earliest
       FROM current_spans
-      WHERE spanType IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_MODEL_SPAN_TYPES)})
+      WHERE spanType IN (${list(coreStorage.TRACE_QUERY_SELECT_MODEL_SPAN_TYPES)})
       GROUP BY traceId
     )
-  ),
-  metric_sums AS (
+  )`);
+      columns.push('any(ms.model) AS model', 'any(ms.timeToFirstTokenMs) AS timeToFirstTokenMs');
+      joins.push('LEFT JOIN model_spans ms ON ms.traceId = c.traceId');
+    }
+    if (needs.metrics) {
+      const read = parameters.add(coreStorage.TRACE_QUERY_SELECT_METRICS.promptCacheReadTokens, 'String');
+      const write = parameters.add(coreStorage.TRACE_QUERY_SELECT_METRICS.promptCacheCreationTokens, 'String');
+      ctes.push(`metric_sums AS (
     SELECT
       traceId,
       if(countIf(name = ${read}) > 0, sumIf(value, name = ${read}), NULL) AS promptCacheReadTokens,
@@ -965,24 +986,21 @@ export function compileClickHouseTableSummaryQueries(
     )
     WHERE (traceId, spanId) IN (SELECT traceId, spanId FROM current_spans)
     GROUP BY traceId
-  )
+  )`);
+      columns.push(
+        'any(mt.promptCacheReadTokens) AS promptCacheReadTokens',
+        'any(mt.promptCacheCreationTokens) AS promptCacheCreationTokens',
+      );
+      joins.push('LEFT JOIN metric_sums mt ON mt.traceId = c.traceId');
+    }
+    return `WITH ${ctes.join(',\n  ')}
 SELECT
-  c.traceId AS traceId,
-  countIf(isNotNull(c.error)) AS errorTotal,
-  countIf(isNotNull(c.error) AND c.spanType IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_LLM_SPAN_TYPES)})) AS errorLlm,
-  countIf(isNotNull(c.error) AND c.spanType IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_TOOL_SPAN_TYPES)})) AS errorTool,
-  any(ms.model) AS model,
-  any(ms.timeToFirstTokenMs) AS timeToFirstTokenMs,
-  any(mt.promptCacheReadTokens) AS promptCacheReadTokens,
-  any(mt.promptCacheCreationTokens) AS promptCacheCreationTokens
+  ${columns.join(',\n  ')}
 FROM current_spans c
-LEFT JOIN model_spans ms ON ms.traceId = c.traceId
-LEFT JOIN metric_sums mt ON mt.traceId = c.traceId
-GROUP BY c.traceId`;
-  });
+${joins.map(join => `${join}\n`).join('')}GROUP BY c.traceId`;
+  };
 
-  const feedback = compile(
-    (parameters, ids, tenant) => `SELECT *
+  const feedback = (parameters: ParameterBuilder, ids: string, tenant: string) => `SELECT *
 FROM (
   SELECT
     traceId, feedbackId, feedbackType, feedbackSource, valueString, valueNumber, comment, timestamp,
@@ -992,7 +1010,7 @@ FROM (
     FROM ${TABLE_FEEDBACK_EVENTS} FINAL
     -- ClickHouse cannot push the trace filter through LIMIT 1 BY, so keep every version of
     -- each feedbackId that ever pointed at one of these traces. A rewrite can move a record
-    -- to another trace, and only its current version belongs in this page's summaries.
+    -- to another trace, and only its current version belongs on this page.
     WHERE feedbackId IN (
       SELECT feedbackId
       FROM ${TABLE_FEEDBACK_EVENTS}
@@ -1003,44 +1021,44 @@ FROM (
   ) AS current
   WHERE traceId IN ${ids}${tenant}
 )
-WHERE relatedRank <= ${parameters.add(relatedLimit, 'UInt64')}
-ORDER BY traceId ASC, relatedRank ASC`,
-  );
+WHERE relatedRank <= ${parameters.add(coreStorage.TRACE_QUERY_FEEDBACK_LIMIT + 1, 'UInt64')}
+ORDER BY traceId ASC, relatedRank ASC`;
 
-  const scores = compile(
-    (parameters, ids, tenant) => `SELECT *
-FROM (
-  SELECT
-    traceId, scoreId, scorerId, scorerVersion, scoreSource, score, timestamp, spanId,
-    row_number() OVER (PARTITION BY traceId ORDER BY timestamp DESC, scoreId ASC) AS relatedRank
-  FROM ${currentScoresRelation()} AS current
-  WHERE traceId IN ${ids}${tenant}
-)
-WHERE relatedRank <= ${parameters.add(relatedLimit, 'UInt64')}
-ORDER BY traceId ASC, relatedRank ASC`,
-  );
+  const scores = (_parameters: ParameterBuilder, ids: string, tenant: string) => `SELECT
+  traceId, scorerId, avg(score) AS average, count() AS count
+FROM ${currentScoresRelation()} AS current
+WHERE traceId IN ${ids}${tenant}
+GROUP BY traceId, scorerId
+ORDER BY traceId ASC, scorerId ASC`;
 
-  return { rollups, feedback, scores };
+  return {
+    ...(needs.spans ? { rollups: compile(rollups) } : {}),
+    ...(needs.feedback ? { feedback: compile(feedback) } : {}),
+    ...(needs.scores ? { scores: compile(scores) } : {}),
+  };
 }
 
 function nullableNumber(value: unknown): number | null {
   return value == null ? null : Number(value);
 }
 
-async function loadTableSummaryRows(
+async function loadSelectionRows(
   client: ClickHouseClient,
   scope: TraceQueryTenantScope | undefined,
   traceIds: string[],
   from: string,
+  needs: coreStorage.TraceQuerySelectionNeeds,
   timeoutMs: () => number,
-): Promise<TableSummaryRows> {
-  const result: TableSummaryRows = { rollups: new Map(), feedback: new Map(), scores: new Map() };
+): Promise<SelectionRows> {
+  const result: SelectionRows = { rollups: new Map(), feedback: new Map(), scores: new Map() };
   if (traceIds.length === 0) return result;
-  const queries = compileClickHouseTableSummaryQueries(scope, traceIds, from);
+  const queries = compileClickHouseSelectionQueries(scope, traceIds, from, needs);
+  const run = (query?: CompiledClickHouseTraceQuery) =>
+    query ? runWithClickHouseTraceQueryTimeout(client, { timeoutMs: timeoutMs() }, query) : Promise.resolve([]);
   const [rollupRows, feedbackRows, scoreRows] = await Promise.all([
-    runWithClickHouseTraceQueryTimeout(client, { timeoutMs: timeoutMs() }, queries.rollups),
-    runWithClickHouseTraceQueryTimeout(client, { timeoutMs: timeoutMs() }, queries.feedback),
-    runWithClickHouseTraceQueryTimeout(client, { timeoutMs: timeoutMs() }, queries.scores),
+    run(queries.rollups),
+    run(queries.feedback),
+    run(queries.scores),
   ]);
   for (const row of rollupRows) {
     result.rollups.set(String(row.traceId), {
@@ -1068,24 +1086,16 @@ async function loadTableSummaryRows(
   }
   for (const row of scoreRows) {
     const traceId = String(row.traceId);
-    const records = result.scores.get(traceId) ?? [];
-    records.push({
-      scoreId: String(row.scoreId),
-      scorerId: String(row.scorerId),
-      scorerVersion: row.scorerVersion == null ? null : String(row.scorerVersion),
-      scoreSource: row.scoreSource == null ? null : String(row.scoreSource),
-      score: Number(row.score),
-      timestamp: asIsoTimestamp(row.timestamp),
-      spanId: row.spanId == null ? null : String(row.spanId),
-    });
-    result.scores.set(traceId, records);
+    const scorers = result.scores.get(traceId) ?? [];
+    scorers.push({ scorerId: String(row.scorerId), average: Number(row.average), count: Number(row.count) });
+    result.scores.set(traceId, scorers);
   }
   return result;
 }
 
-function traceRowToResult(row: Record<string, unknown>, summaries?: TableSummaryRows) {
+function traceRowToResult(row: Record<string, unknown>, plan?: TrustedTraceQueryPlan, selection?: SelectionRows) {
   const traceId = String(row.traceId);
-  const rollup = summaries?.rollups.get(traceId);
+  const rollup = selection?.rollups.get(traceId);
   return {
     traceId,
     rootSpanId: String(row.rootSpanId),
@@ -1103,19 +1113,17 @@ function traceRowToResult(row: Record<string, unknown>, summaries?: TableSummary
     entityType: row.entityType == null ? null : String(row.entityType),
     environment: row.environment == null ? null : String(row.environment),
     status: row.status,
-    ...(summaries
-      ? {
-          tableSummary: coreStorage.buildTraceQueryTableSummary({
-            output: row.output,
-            tags: row.tags,
-            error: row.error,
-            spans: rollup ?? null,
-            feedback: summaries.feedback.get(traceId) ?? [],
-            scores: summaries.scores.get(traceId) ?? [],
-            promptCacheReadTokens: rollup?.promptCacheReadTokens ?? null,
-            promptCacheCreationTokens: rollup?.promptCacheCreationTokens ?? null,
-          }),
-        }
+    ...(plan?.result === 'traces' && selection
+      ? coreStorage.buildTraceQuerySelection(plan, {
+          output: row.output,
+          tags: row.tags,
+          error: row.error,
+          spans: rollup ?? null,
+          promptCacheReadTokens: rollup?.promptCacheReadTokens ?? null,
+          promptCacheCreationTokens: rollup?.promptCacheCreationTokens ?? null,
+          scores: selection.scores.get(traceId) ?? [],
+          feedback: selection.feedback.get(traceId) ?? [],
+        })
       : {}),
   };
 }
@@ -1126,17 +1134,18 @@ async function mapTraceRows(
   rows: Record<string, unknown>[],
   timeoutMs: () => number,
 ) {
-  const summaries =
-    plan.result === 'traces' && plan.tableSummary
-      ? await loadTableSummaryRows(
+  const selection =
+    plan.result === 'traces' && (plan.select || plan.include)
+      ? await loadSelectionRows(
           client,
           plan.scope,
           rows.map(row => String(row.traceId)),
-          coreStorage.traceQueryTableSummaryFrom(plan.timeRange),
+          coreStorage.traceQuerySelectFrom(plan.timeRange),
+          coreStorage.traceQuerySelectionNeeds(plan),
           timeoutMs,
         )
       : undefined;
-  return rows.map(row => traceRowToResult(row, summaries));
+  return rows.map(row => traceRowToResult(row, plan, selection));
 }
 
 export async function queryTraces(
@@ -1201,7 +1210,7 @@ export async function queryTraces(
             startedAt: asIsoTimestamp(row.startedAt),
             endedAt: asIsoTimestamp(row.endedAt),
           })),
-          plan.tableSummary === true,
+          selectedRootColumns(plan),
         ),
       );
       for (const payload of payloadRows) payloads.set(`${payload.traceId}\u0000${payload.rootSpanId}`, payload);

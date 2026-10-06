@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { ObservabilityStorage } from './base';
 import {
-  buildTraceQueryTableSummary,
-  compareTraceQuerySummaryRecords,
+  buildTraceQuerySelection,
+  compareTraceQueryNewestFirst,
   compareTraceQueryStrings,
   createTraceQueryObservedFieldDescriptor,
   encodeTraceQueryCursor,
@@ -35,9 +35,11 @@ import {
   TRACE_QUERY_DEFAULT_TIMEOUT_MS,
   TRACE_QUERY_MAX_STRING_BYTES,
   TRACE_QUERY_MAX_TIMEOUT_MS,
-  TRACE_QUERY_TABLE_SUMMARY_MAX_PAGE_SIZE,
-  TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT,
+  TRACE_QUERY_SELECT_MAX_PAGE_SIZE,
+  TRACE_QUERY_FEEDBACK_LIMIT,
+  TRACE_QUERY_SELECT_FIELDS,
   queryThreadsInputSchema,
+  traceQuerySelectionNeeds,
   queryThreadsResultSchema,
   resolveTraceQueryTimeoutMs,
   traceQueryGroupResponseSchema,
@@ -1904,7 +1906,7 @@ describe('trace-query responses and storage capability', () => {
       false,
     );
     expect(
-      traceQueryTraceResponseSchema.safeParse({ traces: [{ ...trace, scores: [] }], page: { next: null } }).success,
+      traceQueryTraceResponseSchema.safeParse({ traces: [{ ...trace, spans: [] }], page: { next: null } }).success,
     ).toBe(false);
     expect(
       traceQueryGroupResponseSchema.safeParse({ groups: [{ threadId: 'thread-1', count: 1 }], page: { next: null } })
@@ -1960,44 +1962,66 @@ describe('span timestamps', () => {
   });
 });
 
-describe('table summary projection', () => {
-  const withSummary = { ...baseRequest, include: { tableSummary: true } };
+describe('select and include', () => {
+  const withSelect = { ...baseRequest, select: ['errorCounts', 'tags', 'errorCounts'], include: { scores: true } };
 
-  it('marks every ungrouped plan when requested and leaves cursor bindings unchanged', () => {
+  it('normalizes the selection onto every ungrouped plan and leaves cursor bindings unchanged', () => {
     const plain = planTraceQuery(parsed());
-    const keyset = planTraceQuery(parsed(withSummary));
-    const page = planTraceQuery(parsed({ ...withSummary, pagination: { page: 0, perPage: 25 } }));
-    const delta = planTraceQuery(parsed({ ...withSummary, mode: 'delta' }));
+    const keyset = planTraceQuery(parsed(withSelect));
+    const page = planTraceQuery(parsed({ ...withSelect, pagination: { page: 0, perPage: 25 } }));
+    const delta = planTraceQuery(parsed({ ...withSelect, mode: 'delta' }));
+    const selection = { select: ['tags', 'errorCounts'], include: { scores: true } };
 
-    expect(planTraceQuery(parsed())).not.toHaveProperty('tableSummary');
-    expect(keyset).toMatchObject({ paginationMode: 'keyset', tableSummary: true });
-    expect(page).toMatchObject({ paginationMode: 'page', tableSummary: true });
-    expect(delta).toMatchObject({ paginationMode: 'delta', tableSummary: true });
+    expect(plain).not.toHaveProperty('select');
+    expect(plain).not.toHaveProperty('include');
+    expect(keyset).toMatchObject({ paginationMode: 'keyset', ...selection });
+    expect(page).toMatchObject({ paginationMode: 'page', ...selection });
+    expect(delta).toMatchObject({ paginationMode: 'delta', ...selection });
     if (plain.result !== 'traces' || keyset.result !== 'traces') throw new Error('Expected trace plans');
     if (plain.paginationMode !== 'keyset' || keyset.paginationMode !== 'keyset') throw new Error('Expected keyset');
     expect(keyset.binding).toBe(plain.binding);
-    expect(planTraceQuery(parsed({ ...baseRequest, include: { tableSummary: false } }))).not.toHaveProperty(
-      'tableSummary',
-    );
+    const empty = planTraceQuery(parsed({ ...baseRequest, select: [], include: { scores: false, feedback: false } }));
+    expect(empty).not.toHaveProperty('select');
+    expect(empty).not.toHaveProperty('include');
   });
 
-  it('rejects the projection on grouped queries and oversized pages before planning', () => {
-    const grouped = validationError(() => parsed({ ...withSummary, group: { by: ['threadId'] } }));
-    expect(grouped.issues).toContainEqual(
-      expect.objectContaining({ code: 'table_summary_not_supported', path: ['include', 'tableSummary'] }),
-    );
+  it('rejects unknown fields, grouped queries, and oversized pages before planning', () => {
+    expect(traceQueryRequestSchema.safeParse({ ...baseRequest, select: ['input'] }).success).toBe(false);
+    const grouped = validationError(() => parsed({ ...withSelect, group: { by: ['threadId'] } }));
+    expect(grouped.issues).toContainEqual(expect.objectContaining({ code: 'select_not_supported', path: ['select'] }));
     const large = validationError(() =>
-      parsed({ ...withSummary, page: { limit: TRACE_QUERY_TABLE_SUMMARY_MAX_PAGE_SIZE + 1 } }),
+      parsed({ ...baseRequest, include: { feedback: true }, page: { limit: TRACE_QUERY_SELECT_MAX_PAGE_SIZE + 1 } }),
     );
-    expect(large.issues).toContainEqual(
-      expect.objectContaining({ code: 'table_summary_page_too_large', path: ['include', 'tableSummary'] }),
-    );
-    expect(parsed({ ...withSummary, page: { limit: TRACE_QUERY_TABLE_SUMMARY_MAX_PAGE_SIZE } })).toBeTruthy();
+    expect(large.issues).toContainEqual(expect.objectContaining({ code: 'select_page_too_large', path: ['include'] }));
+    expect(parsed({ ...withSelect, page: { limit: TRACE_QUERY_SELECT_MAX_PAGE_SIZE } })).toBeTruthy();
     expect(parsed({ ...baseRequest, page: { limit: 1000 } })).toBeTruthy();
-    expect(traceQueryRequestSchema.safeParse({ ...baseRequest, include: { rows: true } }).success).toBe(false);
   });
 
-  it('assembles bounded summaries with shared preview, tag, and truncation semantics', () => {
+  it('runs only the side queries the selected fields pay for', () => {
+    const none = { output: false, tags: false, error: false, spans: false, errorCounts: false, model: false };
+    expect(traceQuerySelectionNeeds({})).toEqual({ ...none, metrics: false, scores: false, feedback: false });
+    expect(traceQuerySelectionNeeds({ select: ['outputPreview', 'tags', 'errorPreview'] })).toMatchObject({
+      output: true,
+      tags: true,
+      error: true,
+      spans: false,
+    });
+    expect(traceQuerySelectionNeeds({ select: ['timeToFirstTokenMs'] })).toMatchObject({
+      spans: true,
+      errorCounts: false,
+      model: true,
+      metrics: false,
+    });
+    expect(traceQuerySelectionNeeds({ select: ['promptCacheReadTokens'], include: { feedback: true } })).toMatchObject({
+      spans: true,
+      model: false,
+      metrics: true,
+      scores: false,
+      feedback: true,
+    });
+  });
+
+  it('assembles only the requested fields with shared preview, tag, ordering, and truncation semantics', () => {
     const record = (id: number) => ({
       feedbackId: `feedback-${id}`,
       feedbackType: 'rating',
@@ -2006,61 +2030,70 @@ describe('table summary projection', () => {
       comment: null,
       timestamp: '2026-08-10T00:00:00.000Z',
     });
-    const overflow = Array.from({ length: TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT + 1 }, (_, i) => record(i));
-    const summary = buildTraceQueryTableSummary({
+    const overflow = Array.from({ length: TRACE_QUERY_FEEDBACK_LIMIT + 1 }, (_, i) => record(i));
+    const input = {
       output: JSON.stringify({ text: 'The known interaction is with warfarin.', files: [] }),
       tags: '["production", 7, "needs-review"]',
       error:
         '{"message":"The model `gpt-5` does not exist.","name":"AI_APICallError","stack":"AI_APICallError: ...\\n at generate"}',
       spans: { errorTotal: 2, errorLlm: 1, errorTool: 1, model: 'gpt-5', timeToFirstTokenMs: 420.4 },
+      scores: [
+        { scorerId: 'helpfulness', average: 0.5, count: 2 },
+        { scorerId: 'factuality', average: 0.75, count: 4 },
+      ],
       feedback: overflow,
-      scores: [],
       promptCacheReadTokens: 1200,
       promptCacheCreationTokens: null,
-    });
+    };
 
-    expect(summary).toEqual({
+    expect(
+      buildTraceQuerySelection(
+        { select: [...TRACE_QUERY_SELECT_FIELDS], include: { scores: true, feedback: true } },
+        input,
+      ),
+    ).toEqual({
       outputPreview: 'The known interaction is with warfarin.',
       tags: ['production', 'needs-review'],
-      model: 'gpt-5',
-      timeToFirstTokenMs: 420,
       errorPreview: 'AI_APICallError: The model `gpt-5` does not exist.',
       errorCounts: { total: 2, llm: 1, tool: 1 },
+      model: 'gpt-5',
+      timeToFirstTokenMs: 420,
       promptCacheReadTokens: 1200,
       promptCacheCreationTokens: null,
-      feedback: overflow.slice(0, TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT),
+      scores: [
+        { scorerId: 'factuality', average: 0.75, count: 4 },
+        { scorerId: 'helpfulness', average: 0.5, count: 2 },
+      ],
+      feedback: overflow.slice(0, TRACE_QUERY_FEEDBACK_LIMIT),
       feedbackTruncated: true,
-      scores: [],
-      scoresTruncated: false,
     });
+    expect(buildTraceQuerySelection({ select: ['errorCounts'] }, input)).toEqual({
+      errorCounts: { total: 2, llm: 1, tool: 1 },
+    });
+    expect(buildTraceQuerySelection({}, input)).toEqual({});
     expect(
-      buildTraceQueryTableSummary({
-        output: null,
-        tags: null,
-        spans: { errorTotal: 0, errorLlm: 0, errorTool: 0, model: null, timeToFirstTokenMs: -5 },
-        feedback: [],
-        scores: [],
-        promptCacheReadTokens: 0,
-        promptCacheCreationTokens: null,
-      }),
-    ).toMatchObject({
+      buildTraceQuerySelection(
+        { select: ['outputPreview', 'tags', 'errorPreview', 'errorCounts', 'model', 'timeToFirstTokenMs'] },
+        { output: null, tags: null, spans: { timeToFirstTokenMs: -5 } },
+      ),
+    ).toEqual({
       outputPreview: null,
       tags: [],
-      model: null,
-      timeToFirstTokenMs: null,
-      promptCacheReadTokens: 0,
       // A trace whose root did not fail has nothing to preview, even when a child span did.
       errorPreview: null,
+      errorCounts: { total: 0, llm: 0, tool: 0 },
+      model: null,
+      timeToFirstTokenMs: null,
     });
     expect(traceQueryTraceResponseSchema.safeParse({ traces: [], page: { next: null } }).success).toBe(true);
   });
 
-  it('orders summary records newest first with the record ID as the tie-breaker', () => {
+  it('orders feedback newest first with the record ID as the tie-breaker', () => {
     const records = [
       { id: 'b', timestamp: '2026-08-10T00:00:00.000Z' },
       { id: 'a', timestamp: '2026-08-10T00:00:00.000Z' },
       { id: 'c', timestamp: '2026-08-11T00:00:00.000Z' },
     ];
-    expect(records.sort(compareTraceQuerySummaryRecords).map(record => record.id)).toEqual(['c', 'a', 'b']);
+    expect(records.sort(compareTraceQueryNewestFirst).map(record => record.id)).toEqual(['c', 'a', 'b']);
   });
 });

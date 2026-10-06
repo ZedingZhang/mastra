@@ -128,11 +128,16 @@ const TRACE_SELECT = `
   r.environment AS environment,
   ${TRACE_STATUS_SQL} AS status`;
 
-/** The table summary needs the root output and tags; other queries leave the blobs off the read path. */
+/** Adds the root-row columns the selected fields read; other queries leave the blobs off the read path. */
 function traceSelect(plan: TrustedTraceQueryPlan): string {
-  return plan.result === 'traces' && plan.tableSummary
-    ? `${TRACE_SELECT},\n  ${payloadColumnSql('r.output')} AS output,\n  r.tags AS tags,\n  r.error AS error`
-    : TRACE_SELECT;
+  if (plan.result !== 'traces') return TRACE_SELECT;
+  const needs = coreStorage.traceQuerySelectionNeeds(plan);
+  return [
+    TRACE_SELECT,
+    ...(needs.output ? [`  ${payloadColumnSql('r.output')} AS output`] : []),
+    ...(needs.tags ? ['  r.tags AS tags'] : []),
+    ...(needs.error ? ['  r.error AS error'] : []),
+  ].join(',\n');
 }
 
 function fieldDefinition<TField extends string>(
@@ -859,30 +864,36 @@ export function asIsoTimestamp(value: unknown): string {
   return value instanceof Date ? value.toISOString() : new Date(value as string | number).toISOString();
 }
 
-type TableSummaryRollup = NonNullable<coreStorage.TraceQueryTableSummaryInput['spans']> & {
-  promptCacheReadTokens: number | null;
-  promptCacheCreationTokens: number | null;
+type SelectionRollup = NonNullable<coreStorage.TraceQuerySelectionInput['spans']> & {
+  promptCacheReadTokens?: number | null;
+  promptCacheCreationTokens?: number | null;
 };
 
-interface TableSummaryRows {
-  rollups: Map<string, TableSummaryRollup>;
+interface SelectionRows {
+  rollups: Map<string, SelectionRollup>;
   feedback: Map<string, coreStorage.TraceQueryFeedbackSummary[]>;
   scores: Map<string, coreStorage.TraceQueryScoreSummary[]>;
 }
 
 /**
- * Bounded side queries for the selected page only. Each reads the same current-record
- * shape as the trace scope, restricted to the page's trace IDs, and never touches
- * ordering or totals: the page query already fixed them.
+ * Side queries for the selected page only, one per kind of field the request selected. Each reads
+ * the same current-record shape as the trace scope, restricted to the page's trace IDs, and never
+ * touches ordering or totals: the page query already fixed them.
  *
  * Spans and metrics start at `from`, a day before the requested window, so a page of trace IDs
- * does not read every stored event.
+ * does not read every stored event. There is no upper bound: a resumed workflow adds spans to its
+ * trace long after the trace started.
  */
-export function compileDuckDBTableSummaryQueries(
+export function compileDuckDBSelectionQueries(
   scope: TraceQueryTenantScope | undefined,
   traceIds: string[],
   from: string,
-): { rollups: CompiledDuckDBTraceQuery; feedback: CompiledDuckDBTraceQuery; scores: CompiledDuckDBTraceQuery } {
+  needs: coreStorage.TraceQuerySelectionNeeds,
+): {
+  rollups?: CompiledDuckDBTraceQuery;
+  feedback?: CompiledDuckDBTraceQuery;
+  scores?: CompiledDuckDBTraceQuery;
+} {
   const ids = traceIds.map(() => '?').join(', ');
   const tenantConditions = (alias: string): string[] =>
     scope
@@ -902,12 +913,13 @@ export function compileDuckDBTableSummaryQueries(
     values: [...traceIds, ...tenantValues, ...(since ? [from] : [])],
   });
   const list = (types: readonly string[]) => types.map(type => `'${type}'`).join(', ');
-  const relatedLimit = coreStorage.TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT + 1;
 
-  const spanWhere = where('e', true);
-  const metricWhere = where('m', true);
-  const rollups: CompiledDuckDBTraceQuery = {
-    sql: `WITH current_span_rows AS (
+  const compileRollups = (): CompiledDuckDBTraceQuery => {
+    const spanWhere = where('e', true);
+    // Positional parameters bind in text order, so each CTE appends its values as it is added.
+    const values: unknown[] = [...spanWhere.values];
+    const ctes = [
+      `current_span_rows AS (
       SELECT
         e.*,
         coalesce(
@@ -920,22 +932,41 @@ export function compileDuckDBTableSummaryQueries(
         ) AS currentRank
       FROM span_events e
       WHERE ${spanWhere.sql}
-    ),
-    current_spans AS (
+    )`,
+      `current_spans AS (
       SELECT traceId, spanId, spanType, error, startedAt, attributes
       FROM current_span_rows
       WHERE currentRank = 1
-    ),
-    model_spans AS (
+    )`,
+    ];
+    const columns = ['c.traceId AS traceId'];
+    const joins: string[] = [];
+    if (needs.errorCounts) {
+      columns.push(
+        'count(*) FILTER (WHERE c.error IS NOT NULL) AS errorTotal',
+        `count(*) FILTER (WHERE c.error IS NOT NULL AND c.spanType IN (${list(coreStorage.TRACE_QUERY_SELECT_LLM_SPAN_TYPES)})) AS errorLlm`,
+        `count(*) FILTER (WHERE c.error IS NOT NULL AND c.spanType IN (${list(coreStorage.TRACE_QUERY_SELECT_TOOL_SPAN_TYPES)})) AS errorTool`,
+      );
+    }
+    if (needs.model) {
+      ctes.push(`model_spans AS (
       SELECT
         traceId,
         CASE WHEN json_type(attributes, '$.model') = 'VARCHAR' THEN json_extract_string(attributes, '$.model') END AS model,
         ${durationMsSql('startedAt', `CASE WHEN regexp_matches(json_extract_string(attributes, '$.completionStartTime'), ?) THEN TRY_CAST(json_extract_string(attributes, '$.completionStartTime') AS TIMESTAMPTZ) AT TIME ZONE 'UTC' END`)} AS timeToFirstTokenMs,
         row_number() OVER (PARTITION BY traceId ORDER BY startedAt ASC, spanId ASC) AS modelRank
       FROM current_spans
-      WHERE spanType IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_MODEL_SPAN_TYPES)})
-    ),
-    metric_sums AS (
+      WHERE spanType IN (${list(coreStorage.TRACE_QUERY_SELECT_MODEL_SPAN_TYPES)})
+    )`);
+      // The pattern is bound, not inlined: DuckDB counts a `?` inside a string literal as a parameter.
+      values.push(coreStorage.TRACE_QUERY_TIMESTAMP_PATTERN);
+      columns.push('any_value(ms.model) AS model', 'any_value(ms.timeToFirstTokenMs) AS timeToFirstTokenMs');
+      joins.push('LEFT JOIN model_spans ms ON ms.traceId = c.traceId AND ms.modelRank = 1');
+    }
+    if (needs.metrics) {
+      const metricWhere = where('m', true);
+      const { promptCacheReadTokens: read, promptCacheCreationTokens: write } = coreStorage.TRACE_QUERY_SELECT_METRICS;
+      ctes.push(`metric_sums AS (
       SELECT
         m.traceId,
         sum(m.value) FILTER (WHERE m.name = ?) AS promptCacheReadTokens,
@@ -951,30 +982,22 @@ export function compileDuckDBTableSummaryQueries(
       ) m
       INNER JOIN current_spans c ON c.traceId = m.traceId AND c.spanId = m.spanId
       GROUP BY m.traceId
-    )
+    )`);
+      values.push(read, write, ...metricWhere.values, read, write);
+      columns.push(
+        'any_value(mt.promptCacheReadTokens) AS promptCacheReadTokens',
+        'any_value(mt.promptCacheCreationTokens) AS promptCacheCreationTokens',
+      );
+      joins.push('LEFT JOIN metric_sums mt ON mt.traceId = c.traceId');
+    }
+    return {
+      sql: `WITH ${ctes.join(',\n    ')}
 SELECT
-  c.traceId AS traceId,
-  count(*) FILTER (WHERE c.error IS NOT NULL) AS errorTotal,
-  count(*) FILTER (WHERE c.error IS NOT NULL AND c.spanType IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_LLM_SPAN_TYPES)})) AS errorLlm,
-  count(*) FILTER (WHERE c.error IS NOT NULL AND c.spanType IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_TOOL_SPAN_TYPES)})) AS errorTool,
-  any_value(ms.model) AS model,
-  any_value(ms.timeToFirstTokenMs) AS timeToFirstTokenMs,
-  any_value(mt.promptCacheReadTokens) AS promptCacheReadTokens,
-  any_value(mt.promptCacheCreationTokens) AS promptCacheCreationTokens
+  ${columns.join(',\n  ')}
 FROM current_spans c
-LEFT JOIN model_spans ms ON ms.traceId = c.traceId AND ms.modelRank = 1
-LEFT JOIN metric_sums mt ON mt.traceId = c.traceId
-GROUP BY c.traceId`,
-    values: [
-      ...spanWhere.values,
-      // The pattern is bound, not inlined: DuckDB counts a `?` inside a string literal as a parameter.
-      coreStorage.TRACE_QUERY_TIMESTAMP_PATTERN,
-      coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheReadTokens,
-      coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheCreationTokens,
-      ...metricWhere.values,
-      coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheReadTokens,
-      coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheCreationTokens,
-    ],
+${joins.map(join => `${join}\n`).join('')}GROUP BY c.traceId`,
+      values,
+    };
   };
 
   const feedbackWhere = where('f');
@@ -989,44 +1012,46 @@ FROM (
 )
 WHERE relatedRank <= ?
 ORDER BY traceId ASC, relatedRank ASC`,
-    values: [...feedbackWhere.values, relatedLimit],
+    values: [...feedbackWhere.values, coreStorage.TRACE_QUERY_FEEDBACK_LIMIT + 1],
   };
 
   const scoreWhere = where('s');
   const scores: CompiledDuckDBTraceQuery = {
-    sql: `SELECT *
-FROM (
-  SELECT
-    s.traceId, s.scoreId, s.scorerId, s.scorerVersion, s.scoreSource, s.score, s.timestamp, s.spanId,
-    row_number() OVER (PARTITION BY s.traceId ORDER BY s.timestamp DESC, s.scoreId ASC) AS relatedRank
-  FROM score_events s
-  WHERE ${scoreWhere.sql}
-)
-WHERE relatedRank <= ?
-ORDER BY traceId ASC, relatedRank ASC`,
-    values: [...scoreWhere.values, relatedLimit],
+    sql: `SELECT s.traceId, s.scorerId, avg(s.score) AS average, count(*) AS count
+FROM score_events s
+WHERE ${scoreWhere.sql}
+GROUP BY s.traceId, s.scorerId
+ORDER BY s.traceId ASC, s.scorerId ASC`,
+    values: scoreWhere.values,
   };
 
-  return { rollups, feedback, scores };
+  return {
+    ...(needs.spans ? { rollups: compileRollups() } : {}),
+    ...(needs.feedback ? { feedback } : {}),
+    ...(needs.scores ? { scores } : {}),
+  };
 }
 
 function nullableNumber(value: unknown): number | null {
   return value == null ? null : Number(value);
 }
 
-async function loadTableSummaryRows(
+async function loadSelectionRows(
   db: DuckDBConnection,
   scope: TraceQueryTenantScope | undefined,
   traceIds: string[],
   from: string,
-): Promise<TableSummaryRows> {
-  const result: TableSummaryRows = { rollups: new Map(), feedback: new Map(), scores: new Map() };
+  needs: coreStorage.TraceQuerySelectionNeeds,
+): Promise<SelectionRows> {
+  const result: SelectionRows = { rollups: new Map(), feedback: new Map(), scores: new Map() };
   if (traceIds.length === 0) return result;
-  const queries = compileDuckDBTableSummaryQueries(scope, traceIds, from);
+  const queries = compileDuckDBSelectionQueries(scope, traceIds, from, needs);
+  const run = async (query?: CompiledDuckDBTraceQuery) =>
+    query ? db.query<Record<string, unknown>>(query.sql, query.values) : [];
   const [rollupRows, feedbackRows, scoreRows] = await Promise.all([
-    db.query<Record<string, unknown>>(queries.rollups.sql, queries.rollups.values),
-    db.query<Record<string, unknown>>(queries.feedback.sql, queries.feedback.values),
-    db.query<Record<string, unknown>>(queries.scores.sql, queries.scores.values),
+    run(queries.rollups),
+    run(queries.feedback),
+    run(queries.scores),
   ]);
   for (const row of rollupRows) {
     result.rollups.set(String(row.traceId), {
@@ -1054,24 +1079,16 @@ async function loadTableSummaryRows(
   }
   for (const row of scoreRows) {
     const traceId = String(row.traceId);
-    const records = result.scores.get(traceId) ?? [];
-    records.push({
-      scoreId: String(row.scoreId),
-      scorerId: String(row.scorerId),
-      scorerVersion: row.scorerVersion == null ? null : String(row.scorerVersion),
-      scoreSource: row.scoreSource == null ? null : String(row.scoreSource),
-      score: Number(row.score),
-      timestamp: asIsoTimestamp(row.timestamp),
-      spanId: row.spanId == null ? null : String(row.spanId),
-    });
-    result.scores.set(traceId, records);
+    const scorers = result.scores.get(traceId) ?? [];
+    scorers.push({ scorerId: String(row.scorerId), average: Number(row.average), count: Number(row.count) });
+    result.scores.set(traceId, scorers);
   }
   return result;
 }
 
-function traceRowToResult(row: Record<string, unknown>, summaries?: TableSummaryRows) {
+function traceRowToResult(row: Record<string, unknown>, plan?: TrustedTraceQueryPlan, selection?: SelectionRows) {
   const traceId = String(row.traceId);
-  const rollup = summaries?.rollups.get(traceId);
+  const rollup = selection?.rollups.get(traceId);
   return {
     traceId,
     rootSpanId: String(row.rootSpanId),
@@ -1089,34 +1106,33 @@ function traceRowToResult(row: Record<string, unknown>, summaries?: TableSummary
     entityType: row.entityType == null ? null : String(row.entityType),
     environment: row.environment == null ? null : String(row.environment),
     status: row.status,
-    ...(summaries
-      ? {
-          tableSummary: coreStorage.buildTraceQueryTableSummary({
-            output: row.output,
-            tags: row.tags,
-            error: row.error,
-            spans: rollup ?? null,
-            feedback: summaries.feedback.get(traceId) ?? [],
-            scores: summaries.scores.get(traceId) ?? [],
-            promptCacheReadTokens: rollup?.promptCacheReadTokens ?? null,
-            promptCacheCreationTokens: rollup?.promptCacheCreationTokens ?? null,
-          }),
-        }
+    ...(plan?.result === 'traces' && selection
+      ? coreStorage.buildTraceQuerySelection(plan, {
+          output: row.output,
+          tags: row.tags,
+          error: row.error,
+          spans: rollup ?? null,
+          promptCacheReadTokens: rollup?.promptCacheReadTokens ?? null,
+          promptCacheCreationTokens: rollup?.promptCacheCreationTokens ?? null,
+          scores: selection.scores.get(traceId) ?? [],
+          feedback: selection.feedback.get(traceId) ?? [],
+        })
       : {}),
   };
 }
 
 async function mapTraceRows(db: DuckDBConnection, plan: TrustedTraceQueryPlan, rows: Record<string, unknown>[]) {
-  const summaries =
-    plan.result === 'traces' && plan.tableSummary
-      ? await loadTableSummaryRows(
+  const selection =
+    plan.result === 'traces' && (plan.select || plan.include)
+      ? await loadSelectionRows(
           db,
           plan.scope,
           rows.map(row => String(row.traceId)),
-          coreStorage.traceQueryTableSummaryFrom(plan.timeRange),
+          coreStorage.traceQuerySelectFrom(plan.timeRange),
+          coreStorage.traceQuerySelectionNeeds(plan),
         )
       : undefined;
-  return rows.map(row => traceRowToResult(row, summaries));
+  return rows.map(row => traceRowToResult(row, plan, selection));
 }
 
 export async function queryTraces(db: DuckDBConnection, plan: TrustedTraceQueryPlan): Promise<TraceQueryResponse> {

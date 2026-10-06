@@ -28,7 +28,7 @@ const OBSERVABILITY_SPAN_QUERY_STORAGE_FEATURE = 'span-query';
 const OBSERVABILITY_TRACE_QUERY_ROOT_DURATION_STORAGE_FEATURE = 'trace-query-root-duration';
 const OBSERVABILITY_TRACE_QUERY_CONTEXT_IDS_STORAGE_FEATURE = 'trace-query-context-ids';
 const TRACE_QUERY_CONTEXT_ID_FIELDS = new Set(['runId', 'sessionId', 'userId', 'organizationId']);
-const OBSERVABILITY_TRACE_QUERY_TABLE_SUMMARY_STORAGE_FEATURE = 'trace-query-table-summary';
+const OBSERVABILITY_TRACE_QUERY_SELECT_STORAGE_FEATURE = 'trace-query-select';
 const OBSERVABILITY_TRACE_QUERY_DISCOVERY_STORAGE_FEATURE = 'trace-query-discovery';
 const OBSERVABILITY_THREAD_QUERY_STORAGE_FEATURE = 'thread-query';
 const OBSERVABILITY_TRACE_QUERY_TENANT_SCOPE_STORAGE_FEATURE = 'trace-query-tenant-scope';
@@ -194,15 +194,15 @@ export function assertObservabilityTraceQueryContextIdsSupported(
   });
 }
 
-export function assertObservabilityTraceQueryTableSummarySupported(
+export function assertObservabilityTraceQuerySelectSupported(
   observabilityStore: ObservabilityStorage,
   plan: coreStorage.TrustedTraceQueryPlan,
 ) {
-  if (plan.result !== 'traces' || !plan.tableSummary) return;
-  if (getFeatures(observabilityStore)?.includes(OBSERVABILITY_TRACE_QUERY_TABLE_SUMMARY_STORAGE_FEATURE)) return;
+  if (plan.result !== 'traces' || (!plan.select && !plan.include)) return;
+  if (getFeatures(observabilityStore)?.includes(OBSERVABILITY_TRACE_QUERY_SELECT_STORAGE_FEATURE)) return;
 
   throw new HTTPException(501, {
-    message: 'Table summaries are not supported by the configured observability store',
+    message: '`select` and `include` are not supported by the configured observability store',
   });
 }
 

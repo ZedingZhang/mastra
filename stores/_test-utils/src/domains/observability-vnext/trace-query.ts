@@ -1,17 +1,17 @@
 import { coreFeatures } from '@mastra/core/features';
 import {
-  buildTraceQueryTableSummary,
-  compareTraceQuerySummaryRecords,
+  buildTraceQuerySelection,
+  compareTraceQueryNewestFirst,
   parseTraceQueryTimestamp,
-  traceQueryTableSummaryFrom,
+  traceQuerySelectFrom,
   compareTraceQueryStrings,
   encodeTraceQueryCursor,
   encodeTraceQueryDeltaCursor,
-  TRACE_QUERY_TABLE_SUMMARY_LLM_SPAN_TYPES,
-  TRACE_QUERY_TABLE_SUMMARY_METRICS,
-  TRACE_QUERY_TABLE_SUMMARY_MODEL_SPAN_TYPES,
-  TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT,
-  TRACE_QUERY_TABLE_SUMMARY_TOOL_SPAN_TYPES,
+  TRACE_QUERY_SELECT_LLM_SPAN_TYPES,
+  TRACE_QUERY_SELECT_METRICS,
+  TRACE_QUERY_SELECT_MODEL_SPAN_TYPES,
+  TRACE_QUERY_FEEDBACK_LIMIT,
+  TRACE_QUERY_SELECT_TOOL_SPAN_TYPES,
   getTraceQueryDeltaWatermark,
   isTraceAggregateCanonicalDimension,
   TraceQueryCursorError,
@@ -29,7 +29,7 @@ import {
   type TraceQueryPredicate,
   type TraceQueryRequest,
   type TraceQueryResponse,
-  type TraceQueryTableSummary,
+  type TraceQuerySelection,
   type TraceQueryTrace,
   type TraceQueryTraceResponse,
   type TrustedThreadPredicate,
@@ -1066,22 +1066,21 @@ export const TRACE_QUERY_SCORE_TIE_FIXTURE_DATA: TraceQueryFixtureData = {
   feedback: [],
 };
 
-const tableSummaryRange = { from: '2026-08-20T00:00:00Z', to: '2026-08-21T00:00:00Z' };
-const tableSummaryStartedAt = (offsetMs: number) =>
-  new Date(Date.parse(tableSummaryRange.from) + offsetMs).toISOString();
+const selectRange = { from: '2026-08-20T00:00:00Z', to: '2026-08-21T00:00:00Z' };
+const selectStartedAt = (offsetMs: number) => new Date(Date.parse(selectRange.from) + offsetMs).toISOString();
 
 /**
- * The same instant as {@link tableSummaryStartedAt}, written in a zone offset instead of `Z`.
+ * The same instant as {@link selectStartedAt}, written in a zone offset instead of `Z`.
  * A store that drops the offset reads the value hours away from where it belongs.
  */
-const tableSummaryStartedAtInZone = (offsetMs: number, zoneMinutes: number) => {
-  const local = new Date(Date.parse(tableSummaryStartedAt(offsetMs)) + zoneMinutes * 60_000);
+const selectStartedAtInZone = (offsetMs: number, zoneMinutes: number) => {
+  const local = new Date(Date.parse(selectStartedAt(offsetMs)) + zoneMinutes * 60_000);
   const pad = (value: number) => String(value).padStart(2, '0');
   const zone = Math.abs(zoneMinutes);
   return `${local.toISOString().slice(0, 23)}${zoneMinutes < 0 ? '-' : '+'}${pad(Math.floor(zone / 60))}:${pad(zone % 60)}`;
 };
 
-export const TRACE_QUERY_TABLE_SUMMARY_TIME_RANGE = tableSummaryRange;
+export const TRACE_QUERY_SELECT_TIME_RANGE = selectRange;
 
 const summaryMetric = (
   metricId: string,
@@ -1092,7 +1091,7 @@ const summaryMetric = (
   offsetMs: number,
 ): RawTraceQueryMetric => ({
   metricId,
-  timestamp: tableSummaryStartedAt(offsetMs),
+  timestamp: selectStartedAt(offsetMs),
   traceId,
   spanId,
   name,
@@ -1107,19 +1106,19 @@ const summaryMetric = (
 });
 
 /**
- * Traces-table projection fixture. `summary-a` exercises every field: a replaced model
- * span, LLM and tool errors, tags, bounded feedback, more scores than the per-trace
- * limit, a rewritten score, and cache-token metrics including rows the projection must
+ * `select` and `include` fixture. `summary-a` exercises every field: a replaced model
+ * span, LLM and tool errors, tags, feedback, several scorers scoring both the root and a span,
+ * a rewritten score, and cache-token metrics including rows the selection must
  * ignore, a retried metric row, and a span whose clock runs behind the root's. `summary-b` is a
  * failed root whose error carries a class and a stack. `summary-c` has an earliest model span without a model and
  * with an unparseable first-token time, a later complete one, rewritten feedback, and a feedback
  * record rewritten onto it from `summary-a`.
  */
-export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
+export const TRACE_QUERY_SELECT_FIXTURE_DATA: TraceQueryFixtureData = {
   spans: [
     span(1, 'summary-a', 'root-a', {
-      startedAt: tableSummaryStartedAt(0),
-      endedAt: tableSummaryStartedAt(5000),
+      startedAt: selectStartedAt(0),
+      endedAt: selectStartedAt(5000),
       tags: ['production', 'needs-review'],
       output: { text: 'The known interaction is with warfarin.', files: [] },
       threadId: 'thread-summary',
@@ -1128,49 +1127,49 @@ export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
       parentSpanId: 'root-a',
       spanType: 'model_generation',
       isPending: true,
-      startedAt: tableSummaryStartedAt(100),
+      startedAt: selectStartedAt(100),
       endedAt: null,
       attributes: { model: 'gpt-5', provider: 'openai' },
     }),
     span(3, 'summary-a', 'model-a-1', {
       parentSpanId: 'root-a',
       spanType: 'model_generation',
-      startedAt: tableSummaryStartedAt(100),
-      endedAt: tableSummaryStartedAt(1500),
+      startedAt: selectStartedAt(100),
+      endedAt: selectStartedAt(1500),
       // Written in +05:30 rather than UTC: the first-token time is the same instant, and a store
       // that drops the offset reports hours instead of the 420 ms the other stores report.
       attributes: {
         model: 'gpt-5',
         provider: 'openai',
-        completionStartTime: tableSummaryStartedAtInZone(520, 330),
+        completionStartTime: selectStartedAtInZone(520, 330),
       },
     }),
     span(4, 'summary-a', 'model-a-2', {
       parentSpanId: 'root-a',
       spanType: 'model_generation',
-      startedAt: tableSummaryStartedAt(2000),
-      endedAt: tableSummaryStartedAt(2500),
-      attributes: { model: 'gpt-4o', provider: 'openai', completionStartTime: tableSummaryStartedAt(2100) },
+      startedAt: selectStartedAt(2000),
+      endedAt: selectStartedAt(2500),
+      attributes: { model: 'gpt-4o', provider: 'openai', completionStartTime: selectStartedAt(2100) },
       error: { message: 'rate limited' },
     }),
     span(5, 'summary-a', 'tool-a-1', {
       parentSpanId: 'root-a',
       spanType: 'tool_call',
-      startedAt: tableSummaryStartedAt(1600),
-      endedAt: tableSummaryStartedAt(1900),
+      startedAt: selectStartedAt(1600),
+      endedAt: selectStartedAt(1900),
       error: { message: 'lookup failed' },
     }),
     span(6, 'summary-a', 'tool-a-2', {
       parentSpanId: 'root-a',
       spanType: 'tool_call',
-      startedAt: tableSummaryStartedAt(3000),
-      endedAt: tableSummaryStartedAt(3200),
+      startedAt: selectStartedAt(3000),
+      endedAt: selectStartedAt(3200),
     }),
     span(7, 'summary-a', 'generic-a', {
       parentSpanId: 'root-a',
       spanType: 'generic',
-      startedAt: tableSummaryStartedAt(3300),
-      endedAt: tableSummaryStartedAt(3400),
+      startedAt: selectStartedAt(3300),
+      endedAt: selectStartedAt(3400),
       error: { message: 'post-processing failed' },
     }),
     // Imported spans can carry a clock that runs behind the root's, which puts this one before
@@ -1178,13 +1177,13 @@ export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
     span(12, 'summary-a', 'tool-a-early', {
       parentSpanId: 'root-a',
       spanType: 'tool_call',
-      startedAt: tableSummaryStartedAt(-2000),
-      endedAt: tableSummaryStartedAt(-1500),
+      startedAt: selectStartedAt(-2000),
+      endedAt: selectStartedAt(-1500),
       error: { message: 'cache warm-up failed' },
     }),
     span(8, 'summary-b', 'root-b', {
-      startedAt: tableSummaryStartedAt(10_000),
-      endedAt: tableSummaryStartedAt(11_000),
+      startedAt: selectStartedAt(10_000),
+      endedAt: selectStartedAt(11_000),
       // The error a Traces table shows: its class, its message, and a stack the preview drops.
       error: {
         message: 'The model `gpt-5` does not exist or you do not have access to it.',
@@ -1193,8 +1192,8 @@ export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
       },
     }),
     span(9, 'summary-c', 'root-c', {
-      startedAt: tableSummaryStartedAt(20_000),
-      endedAt: tableSummaryStartedAt(24_000),
+      startedAt: selectStartedAt(20_000),
+      endedAt: selectStartedAt(24_000),
       tags: ['staging'],
       output: 'plain text answer',
     }),
@@ -1205,69 +1204,70 @@ export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
     span(10, 'summary-c', 'model-c-1', {
       parentSpanId: 'root-c',
       spanType: 'model_generation',
-      startedAt: tableSummaryStartedAt(20_100),
-      endedAt: tableSummaryStartedAt(21_000),
+      startedAt: selectStartedAt(20_100),
+      endedAt: selectStartedAt(21_000),
       attributes: { provider: 'anthropic', completionStartTime: '2026-09-31T10:00:00.000Z' },
     }),
     span(11, 'summary-c', 'model-c-2', {
       parentSpanId: 'root-c',
       spanType: 'model_generation',
-      startedAt: tableSummaryStartedAt(22_000),
-      endedAt: tableSummaryStartedAt(23_000),
+      startedAt: selectStartedAt(22_000),
+      endedAt: selectStartedAt(23_000),
       attributes: {
         model: 'claude-fable-5-1',
         provider: 'anthropic',
-        completionStartTime: tableSummaryStartedAt(22_300),
+        completionStartTime: selectStartedAt(22_300),
       },
     }),
   ],
   scores: [
-    ...Array.from({ length: TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT + 1 }, (_, index) =>
-      scoreRecord(100 + index, `score-a-${index}`, 'summary-a', `scorer-${index % 3}`, index / 20, {
-        timestamp: tableSummaryStartedAt(6000 + index * 1000),
+    // Sixteenths add and divide exactly, so every engine's average matches the reference's bit for bit.
+    ...Array.from({ length: 11 }, (_, index) =>
+      scoreRecord(100 + index, `score-a-${index}`, 'summary-a', `scorer-${index % 3}`, index / 16, {
+        timestamp: selectStartedAt(6000 + index * 1000),
         scorerVersion: index % 2 === 0 ? '1.0' : '2.0',
         scoreSource: 'automated',
         spanId: index === 0 ? 'model-a-1' : null,
       }),
     ),
     scoreRecord(200, 'score-a-rewritten', 'summary-a', 'factuality', 0.2, {
-      timestamp: tableSummaryStartedAt(6500),
+      timestamp: selectStartedAt(6500),
       scoreSource: 'automated',
     }),
     scoreRecord(201, 'score-a-rewritten', 'summary-a', 'factuality', 0.8, {
-      timestamp: tableSummaryStartedAt(6500),
+      timestamp: selectStartedAt(6500),
       scoreSource: 'automated',
     }),
     scoreRecord(202, 'score-c-1', 'summary-c', 'factuality', 0.42, {
-      timestamp: tableSummaryStartedAt(25_000),
+      timestamp: selectStartedAt(25_000),
       scorerVersion: '2.0',
       scoreSource: 'human',
     }),
   ],
   feedback: [
     feedbackRecord(300, 'feedback-a-1', 'summary-a', 'thumbs_down', 'patient', 0, {
-      timestamp: tableSummaryStartedAt(7000),
+      timestamp: selectStartedAt(7000),
       comment: 'Interaction omitted',
     }),
     feedbackRecord(301, 'feedback-a-2', 'summary-a', 'rating', 'clinician', 'helpful', {
-      timestamp: tableSummaryStartedAt(8000),
+      timestamp: selectStartedAt(8000),
     }),
     feedbackRecord(302, 'feedback-c-1', 'summary-c', 'rating', 'user', 3, {
-      timestamp: tableSummaryStartedAt(26_000),
+      timestamp: selectStartedAt(26_000),
       comment: 'first draft',
     }),
     feedbackRecord(303, 'feedback-c-1', 'summary-c', 'rating', 'user', 5, {
-      timestamp: tableSummaryStartedAt(26_000),
+      timestamp: selectStartedAt(26_000),
       comment: 'revised',
     }),
     // Rewritten onto another trace: only the current version belongs in a summary, so this
     // record counts for `summary-c` and must not reappear under `summary-a`.
     feedbackRecord(304, 'feedback-moved', 'summary-a', 'thumbs_up', 'patient', 1, {
-      timestamp: tableSummaryStartedAt(7500),
+      timestamp: selectStartedAt(7500),
       comment: 'filed against the wrong trace',
     }),
     feedbackRecord(305, 'feedback-moved', 'summary-c', 'thumbs_up', 'patient', 1, {
-      timestamp: tableSummaryStartedAt(27_000),
+      timestamp: selectStartedAt(27_000),
       comment: 'filed against the wrong trace',
     }),
   ],
@@ -2833,17 +2833,10 @@ export function evaluateTraceQuery(data: TraceQueryFixtureData, plan: TrustedTra
   const scores = currentScores(data.scores).filter(score => matchesScope(score, plan.scope));
   const feedback = currentFeedback(data.feedback).filter(record => matchesScope(record, plan.scope));
   const toTrace = (root: RawTraceQuerySpan): TraceQueryTrace =>
-    plan.tableSummary
+    plan.select || plan.include
       ? {
           ...toTraceQueryTrace(root),
-          tableSummary: evaluateTableSummary(
-            root,
-            spans,
-            scores,
-            feedback,
-            data.metrics,
-            traceQueryTableSummaryFrom(plan.timeRange),
-          ),
+          ...evaluateSelection(plan, root, spans, scores, feedback, data.metrics, traceQuerySelectFrom(plan.timeRange)),
         }
       : toTraceQueryTrace(root);
   if (plan.paginationMode === 'delta') {
@@ -3253,19 +3246,20 @@ function currentMetrics(metrics: RawTraceQueryMetric[]): RawTraceQueryMetric[] {
   return [...records.values()];
 }
 
-function evaluateTableSummary(
+function evaluateSelection(
+  plan: Pick<TrustedTraceQueryKeysetTracesPlan, 'select' | 'include'>,
   root: RawTraceQuerySpan,
   spans: RawTraceQuerySpan[],
   scores: RawTraceQueryScore[],
   feedback: RawTraceQueryFeedback[],
   metrics: RawTraceQueryMetric[] = [],
   from = '',
-): TraceQueryTableSummary {
+): TraceQuerySelection {
   // Spans and metrics are read from `from`, a day before the requested window; feedback and
   // scores are not, because a reviewer can add them at any time afterwards.
   const traceSpans = spans.filter(span => span.traceId === root.traceId && (span.endedAt ?? '') >= from);
   const modelSpan = traceSpans
-    .filter(span => TRACE_QUERY_TABLE_SUMMARY_MODEL_SPAN_TYPES.includes(span.spanType))
+    .filter(span => TRACE_QUERY_SELECT_MODEL_SPAN_TYPES.includes(span.spanType))
     .sort(
       (left, right) =>
         compareTraceQueryStrings(left.startedAt, right.startedAt) ||
@@ -3287,17 +3281,25 @@ function evaluateTableSummary(
     );
     return rows.length ? rows.reduce((total, metric) => total + metric.value, 0) : null;
   };
-  return buildTraceQueryTableSummary({
+  const scorers = new Map<string, { total: number; count: number }>();
+  for (const record of scores) {
+    if (record.traceId !== root.traceId || record.score === null) continue;
+    const scorer = scorers.get(record.scorerId) ?? { total: 0, count: 0 };
+    scorer.total += record.score;
+    scorer.count += 1;
+    scorers.set(record.scorerId, scorer);
+  }
+  return buildTraceQuerySelection(plan, {
     output: root.output ?? null,
     tags: root.tags,
     error: root.error,
     spans: {
       errorTotal: traceSpans.filter(span => span.error !== null).length,
       errorLlm: traceSpans.filter(
-        span => span.error !== null && TRACE_QUERY_TABLE_SUMMARY_LLM_SPAN_TYPES.includes(span.spanType),
+        span => span.error !== null && TRACE_QUERY_SELECT_LLM_SPAN_TYPES.includes(span.spanType),
       ).length,
       errorTool: traceSpans.filter(
-        span => span.error !== null && TRACE_QUERY_TABLE_SUMMARY_TOOL_SPAN_TYPES.includes(span.spanType),
+        span => span.error !== null && TRACE_QUERY_SELECT_TOOL_SPAN_TYPES.includes(span.spanType),
       ).length,
       model: typeof model === 'string' ? model : null,
       timeToFirstTokenMs,
@@ -3313,32 +3315,15 @@ function evaluateTableSummary(
         timestamp: record.timestamp,
       }))
       .sort((left, right) =>
-        compareTraceQuerySummaryRecords(
+        compareTraceQueryNewestFirst(
           { timestamp: left.timestamp, id: left.feedbackId },
           { timestamp: right.timestamp, id: right.feedbackId },
         ),
       )
-      .slice(0, TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT + 1),
-    scores: scores
-      .filter(record => record.traceId === root.traceId && record.score !== null)
-      .map(record => ({
-        scoreId: record.scoreId,
-        scorerId: record.scorerId,
-        scorerVersion: record.scorerVersion,
-        scoreSource: record.scoreSource,
-        score: record.score!,
-        timestamp: record.timestamp,
-        spanId: record.spanId,
-      }))
-      .sort((left, right) =>
-        compareTraceQuerySummaryRecords(
-          { timestamp: left.timestamp, id: left.scoreId },
-          { timestamp: right.timestamp, id: right.scoreId },
-        ),
-      )
-      .slice(0, TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT + 1),
-    promptCacheReadTokens: sumMetric(TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheReadTokens),
-    promptCacheCreationTokens: sumMetric(TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheCreationTokens),
+      .slice(0, TRACE_QUERY_FEEDBACK_LIMIT + 1),
+    scores: [...scorers].map(([scorerId, { total, count }]) => ({ scorerId, average: total / count, count })),
+    promptCacheReadTokens: sumMetric(TRACE_QUERY_SELECT_METRICS.promptCacheReadTokens),
+    promptCacheCreationTokens: sumMetric(TRACE_QUERY_SELECT_METRICS.promptCacheCreationTokens),
   });
 }
 

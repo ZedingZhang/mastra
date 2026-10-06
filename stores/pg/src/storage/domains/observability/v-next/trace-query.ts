@@ -132,11 +132,12 @@ const TRACE_SELECT = `
   r."environment" AS "environment",
   ${TRACE_STATUS_SQL} AS "status"`;
 
-/** The table summary needs the root output and tags; other queries leave the blobs off the read path. */
+/** Adds the root-row columns the selected fields read; other queries leave the blobs off the read path. */
 function traceSelect(plan: TrustedTraceQueryPlan): string {
-  return plan.result === 'traces' && plan.tableSummary
-    ? `${TRACE_SELECT},\n  r."output" AS "output",\n  r."tags" AS "tags",\n  r."error" AS "error"`
-    : TRACE_SELECT;
+  if (plan.result !== 'traces') return TRACE_SELECT;
+  const needs = coreStorage.traceQuerySelectionNeeds(plan);
+  const columns = (['output', 'tags', 'error'] as const).filter(column => needs[column]);
+  return [TRACE_SELECT, ...columns.map(column => `  r."${column}" AS "${column}"`)].join(',\n');
 }
 
 function fieldSql<TField extends string>(
@@ -948,37 +949,42 @@ async function setRemainingTimeout(transaction: TxClient, deadline: number): Pro
   await transaction.query(`SELECT set_config('statement_timeout', $1, true)`, [`${remainingTimeoutMs}ms`]);
 }
 
-type TableSummaryRollup = NonNullable<coreStorage.TraceQueryTableSummaryInput['spans']> & {
-  promptCacheReadTokens: number | null;
-  promptCacheCreationTokens: number | null;
+type SelectionRollup = NonNullable<coreStorage.TraceQuerySelectionInput['spans']> & {
+  promptCacheReadTokens?: number | null;
+  promptCacheCreationTokens?: number | null;
 };
 
-interface TableSummaryRows {
-  rollups: Map<string, TableSummaryRollup>;
+interface SelectionRows {
+  rollups: Map<string, SelectionRollup>;
   feedback: Map<string, coreStorage.TraceQueryFeedbackSummary[]>;
   scores: Map<string, coreStorage.TraceQueryScoreSummary[]>;
 }
 
 /**
- * Bounded side queries for the selected page only. Each reads the same current-record
- * shape as the trace scope, restricted to the page's trace IDs, and never touches
- * ordering or totals: the page query already fixed them.
+ * Side queries for the selected page only, one per kind of field the request selected. Each reads
+ * the same current-record shape as the trace scope, restricted to the page's trace IDs, and never
+ * touches ordering or totals: the page query already fixed them.
  *
  * Spans and metrics start at `from`, a day before the requested window, so a page of trace IDs
- * does not open every partition.
+ * does not open every partition. There is no upper bound: a resumed workflow adds spans to its
+ * trace long after the trace started.
  */
-export function compilePostgresTableSummaryQueries(
+export function compilePostgresSelectionQueries(
   schema: string,
   scope: TraceQueryTenantScope | undefined,
   traceIds: string[],
   from: string,
-): { rollups: CompiledPostgresTraceQuery; feedback: CompiledPostgresTraceQuery; scores: CompiledPostgresTraceQuery } {
+  needs: coreStorage.TraceQuerySelectionNeeds,
+): {
+  rollups?: CompiledPostgresTraceQuery;
+  feedback?: CompiledPostgresTraceQuery;
+  scores?: CompiledPostgresTraceQuery;
+} {
   const spanTable = qualifiedTable(schema, TABLE_SPAN_EVENTS);
   const metricTable = qualifiedTable(schema, TABLE_METRIC_EVENTS);
   const scoreTable = qualifiedTable(schema, TABLE_SCORE_EVENTS);
   const feedbackTable = qualifiedTable(schema, TABLE_FEEDBACK_EVENTS);
   const list = (types: readonly string[]) => types.map(type => `'${type}'`).join(', ');
-  const relatedLimit = coreStorage.TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT + 1;
 
   // $1 is always the trace ID array; tenant scope binds the next positions.
   const values: unknown[] = [traceIds];
@@ -993,24 +999,30 @@ export function compilePostgresTableSummaryQueries(
   }
   const scopeSql = (alias: string): string =>
     scopeConditions.map(condition => `\n      AND ${alias}.${condition}`).join('');
-  const readMetric = `$${values.length + 1}`;
-  const writeMetric = `$${values.length + 2}`;
-  const since = `$${values.length + 3}::timestamptz`;
-  const rollupValues = [
-    ...values,
-    coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheReadTokens,
-    coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheCreationTokens,
-    from,
-  ];
-  const rollups: CompiledPostgresTraceQuery = {
-    text: `WITH current_spans AS (
+
+  const compileRollups = (): CompiledPostgresTraceQuery => {
+    const rollupValues = [...values, from];
+    const since = `$${rollupValues.length}::timestamptz`;
+    const ctes = [
+      `current_spans AS (
     SELECT s."traceId", s."spanId", s."spanType", s."error", s."startedAt", s."attributes"
     FROM ${spanTable} s
     WHERE s."traceId" = ANY($1::text[])
       AND s."endedAt" >= ${since}
       AND ${latestSpanPredicate(spanTable)}${scopeSql('s')}
-  ),
-  model_spans AS (
+  )`,
+    ];
+    const columns = ['c."traceId" AS "traceId"'];
+    const joins: string[] = [];
+    if (needs.errorCounts) {
+      columns.push(
+        'count(*) FILTER (WHERE c."error" IS NOT NULL) AS "errorTotal"',
+        `count(*) FILTER (WHERE c."error" IS NOT NULL AND c."spanType" IN (${list(coreStorage.TRACE_QUERY_SELECT_LLM_SPAN_TYPES)})) AS "errorLlm"`,
+        `count(*) FILTER (WHERE c."error" IS NOT NULL AND c."spanType" IN (${list(coreStorage.TRACE_QUERY_SELECT_TOOL_SPAN_TYPES)})) AS "errorTool"`,
+      );
+    }
+    if (needs.model) {
+      ctes.push(`model_spans AS (
     SELECT DISTINCT ON ("traceId")
       "traceId",
       CASE WHEN jsonb_typeof("attributes" -> 'model') = 'string' THEN "attributes" ->> 'model' END AS "model",
@@ -1020,10 +1032,24 @@ export function compilePostgresTableSummaryQueries(
         THEN "attributes" ->> 'completionStartTime'
       END AS "completionStartTime"
     FROM current_spans
-    WHERE "spanType" IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_MODEL_SPAN_TYPES)})
+    WHERE "spanType" IN (${list(coreStorage.TRACE_QUERY_SELECT_MODEL_SPAN_TYPES)})
     ORDER BY "traceId", "startedAt" ASC, "spanId" ASC
-  ),
-  metric_sums AS (
+  )`);
+      columns.push(
+        'max(ms."model") AS "model"',
+        'max(ms."modelStartedAt") AS "modelStartedAt"',
+        'max(ms."completionStartTime") AS "completionStartTime"',
+      );
+      joins.push('LEFT JOIN model_spans ms ON ms."traceId" = c."traceId"');
+    }
+    if (needs.metrics) {
+      rollupValues.push(
+        coreStorage.TRACE_QUERY_SELECT_METRICS.promptCacheReadTokens,
+        coreStorage.TRACE_QUERY_SELECT_METRICS.promptCacheCreationTokens,
+      );
+      const readMetric = `$${rollupValues.length - 1}`;
+      const writeMetric = `$${rollupValues.length}`;
+      ctes.push(`metric_sums AS (
     SELECT
       m."traceId",
       sum(m."value") FILTER (WHERE m."name" = ${readMetric}) AS "promptCacheReadTokens",
@@ -1040,22 +1066,21 @@ export function compilePostgresTableSummaryQueries(
     ) m
     INNER JOIN current_spans c ON c."traceId" = m."traceId" AND c."spanId" = m."spanId"
     GROUP BY m."traceId"
-  )
+  )`);
+      columns.push(
+        'max(mt."promptCacheReadTokens") AS "promptCacheReadTokens"',
+        'max(mt."promptCacheCreationTokens") AS "promptCacheCreationTokens"',
+      );
+      joins.push('LEFT JOIN metric_sums mt ON mt."traceId" = c."traceId"');
+    }
+    return {
+      text: `WITH ${ctes.join(',\n  ')}
 SELECT
-  c."traceId" AS "traceId",
-  count(*) FILTER (WHERE c."error" IS NOT NULL) AS "errorTotal",
-  count(*) FILTER (WHERE c."error" IS NOT NULL AND c."spanType" IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_LLM_SPAN_TYPES)})) AS "errorLlm",
-  count(*) FILTER (WHERE c."error" IS NOT NULL AND c."spanType" IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_TOOL_SPAN_TYPES)})) AS "errorTool",
-  max(ms."model") AS "model",
-  max(ms."modelStartedAt") AS "modelStartedAt",
-  max(ms."completionStartTime") AS "completionStartTime",
-  max(mt."promptCacheReadTokens") AS "promptCacheReadTokens",
-  max(mt."promptCacheCreationTokens") AS "promptCacheCreationTokens"
+  ${columns.join(',\n  ')}
 FROM current_spans c
-LEFT JOIN model_spans ms ON ms."traceId" = c."traceId"
-LEFT JOIN metric_sums mt ON mt."traceId" = c."traceId"
-GROUP BY c."traceId"`,
-    values: rollupValues,
+${joins.map(join => `${join}\n`).join('')}GROUP BY c."traceId"`,
+      values: rollupValues,
+    };
   };
 
   const feedback: CompiledPostgresTraceQuery = {
@@ -1070,25 +1095,24 @@ FROM (
 ) ranked
 WHERE "relatedRank" <= $${values.length + 1}
 ORDER BY "traceId" ASC, "relatedRank" ASC`,
-    values: [...values, relatedLimit],
+    values: [...values, coreStorage.TRACE_QUERY_FEEDBACK_LIMIT + 1],
   };
 
   const scores: CompiledPostgresTraceQuery = {
-    text: `SELECT *
-FROM (
-  SELECT
-    s."traceId", s."scoreId", s."scorerId", s."scorerVersion", s."scoreSource", s."score", s."timestamp", s."spanId",
-    row_number() OVER (PARTITION BY s."traceId" ORDER BY s."timestamp" DESC, s."scoreId" ASC) AS "relatedRank"
-  FROM ${scoreTable} s
-  WHERE s."traceId" = ANY($1::text[])
-    AND ${latestScorePredicate(scoreTable)}${scopeSql('s')}
-) ranked
-WHERE "relatedRank" <= $${values.length + 1}
-ORDER BY "traceId" ASC, "relatedRank" ASC`,
-    values: [...values, relatedLimit],
+    text: `SELECT s."traceId", s."scorerId", avg(s."score") AS "average", count(*) AS "count"
+FROM ${scoreTable} s
+WHERE s."traceId" = ANY($1::text[])
+  AND ${latestScorePredicate(scoreTable)}${scopeSql('s')}
+GROUP BY s."traceId", s."scorerId"
+ORDER BY s."traceId" ASC, s."scorerId" ASC`,
+    values,
   };
 
-  return { rollups, feedback, scores };
+  return {
+    ...(needs.spans ? { rollups: compileRollups() } : {}),
+    ...(needs.feedback ? { feedback } : {}),
+    ...(needs.scores ? { scores } : {}),
+  };
 }
 
 function timeToFirstToken(startedAt: unknown, completionStartTime: unknown): number | null {
@@ -1103,19 +1127,21 @@ function nullableNumber(value: unknown): number | null {
   return value == null ? null : Number(value);
 }
 
-async function loadTableSummaryRows(
+async function loadSelectionRows(
   transaction: TxClient,
   schema: string,
   scope: TraceQueryTenantScope | undefined,
   traceIds: string[],
   from: string,
+  needs: coreStorage.TraceQuerySelectionNeeds,
   deadline?: number,
-): Promise<TableSummaryRows> {
-  const result: TableSummaryRows = { rollups: new Map(), feedback: new Map(), scores: new Map() };
+): Promise<SelectionRows> {
+  const result: SelectionRows = { rollups: new Map(), feedback: new Map(), scores: new Map() };
   if (traceIds.length === 0) return result;
-  const queries = compilePostgresTableSummaryQueries(schema, scope, traceIds, from);
+  const queries = compilePostgresSelectionQueries(schema, scope, traceIds, from, needs);
   // `statement_timeout` is per statement, so re-derive the remaining budget before each one.
-  const run = async (query: CompiledPostgresTraceQuery) => {
+  const run = async (query?: CompiledPostgresTraceQuery) => {
+    if (!query) return [];
     if (deadline !== undefined) await setRemainingTimeout(transaction, deadline);
     return transaction.any<Record<string, unknown>>(query.text, query.values);
   };
@@ -1150,24 +1176,16 @@ async function loadTableSummaryRows(
   }
   for (const row of scoreRows) {
     const traceId = String(row.traceId);
-    const records = result.scores.get(traceId) ?? [];
-    records.push({
-      scoreId: String(row.scoreId),
-      scorerId: String(row.scorerId),
-      scorerVersion: row.scorerVersion == null ? null : String(row.scorerVersion),
-      scoreSource: row.scoreSource == null ? null : String(row.scoreSource),
-      score: Number(row.score),
-      timestamp: asIsoTimestamp(row.timestamp),
-      spanId: row.spanId == null ? null : String(row.spanId),
-    });
-    result.scores.set(traceId, records);
+    const scorers = result.scores.get(traceId) ?? [];
+    scorers.push({ scorerId: String(row.scorerId), average: Number(row.average), count: Number(row.count) });
+    result.scores.set(traceId, scorers);
   }
   return result;
 }
 
-function traceRowToResult(row: Record<string, unknown>, summaries?: TableSummaryRows) {
+function traceRowToResult(row: Record<string, unknown>, plan?: TrustedTraceQueryPlan, selection?: SelectionRows) {
   const traceId = String(row.traceId);
-  const rollup = summaries?.rollups.get(traceId);
+  const rollup = selection?.rollups.get(traceId);
   return {
     traceId,
     rootSpanId: String(row.rootSpanId),
@@ -1185,24 +1203,22 @@ function traceRowToResult(row: Record<string, unknown>, summaries?: TableSummary
     entityType: row.entityType == null ? null : String(row.entityType),
     environment: row.environment == null ? null : String(row.environment),
     status: row.status,
-    ...(summaries
-      ? {
-          tableSummary: coreStorage.buildTraceQueryTableSummary({
-            output: row.output,
-            tags: row.tags,
-            error: row.error,
-            spans: rollup ?? null,
-            feedback: summaries.feedback.get(traceId) ?? [],
-            scores: summaries.scores.get(traceId) ?? [],
-            promptCacheReadTokens: rollup?.promptCacheReadTokens ?? null,
-            promptCacheCreationTokens: rollup?.promptCacheCreationTokens ?? null,
-          }),
-        }
+    ...(plan?.result === 'traces' && selection
+      ? coreStorage.buildTraceQuerySelection(plan, {
+          output: row.output,
+          tags: row.tags,
+          error: row.error,
+          spans: rollup ?? null,
+          promptCacheReadTokens: rollup?.promptCacheReadTokens ?? null,
+          promptCacheCreationTokens: rollup?.promptCacheCreationTokens ?? null,
+          scores: selection.scores.get(traceId) ?? [],
+          feedback: selection.feedback.get(traceId) ?? [],
+        })
       : {}),
   };
 }
 
-/** Maps page rows and, when the plan asks for it, enriches them inside the same transaction. */
+/** Maps page rows and, when the plan selects fields, enriches them inside the same transaction. */
 async function mapTraceRows(
   transaction: TxClient,
   schema: string,
@@ -1210,18 +1226,19 @@ async function mapTraceRows(
   rows: Record<string, unknown>[],
   deadline?: number,
 ) {
-  let summaries: TableSummaryRows | undefined;
-  if (plan.result === 'traces' && plan.tableSummary) {
-    summaries = await loadTableSummaryRows(
+  let selection: SelectionRows | undefined;
+  if (plan.result === 'traces' && (plan.select || plan.include)) {
+    selection = await loadSelectionRows(
       transaction,
       schema,
       plan.scope,
       rows.map(row => String(row.traceId)),
-      coreStorage.traceQueryTableSummaryFrom(plan.timeRange),
+      coreStorage.traceQuerySelectFrom(plan.timeRange),
+      coreStorage.traceQuerySelectionNeeds(plan),
       deadline,
     );
   }
-  return rows.map(row => traceRowToResult(row, summaries));
+  return rows.map(row => traceRowToResult(row, plan, selection));
 }
 
 export async function queryTraces(

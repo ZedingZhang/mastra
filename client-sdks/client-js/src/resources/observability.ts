@@ -170,13 +170,14 @@ export type QueryTracesDeltaInput = Omit<QueryTracesBaseInput, 'orderBy'> & {
   orderBy?: never;
 };
 
-export type QueryTracesGroupedInput = Omit<QueryTracesBaseInput, 'include'> & {
+export type QueryTracesGroupedInput = Omit<QueryTracesBaseInput, 'select' | 'include'> & {
   /**
    * @deprecated Use `queryTraceThreads()` instead. Grouped trace queries remain supported until the next major release.
    */
   group: NonNullable<TraceQueryRequest['group']>;
-  /** A group response has no trace rows to carry the table summary, so the server rejects it here. */
-  include?: { tableSummary?: false };
+  /** A group response has no trace rows to carry selected fields, so the server rejects them here. */
+  select?: never;
+  include?: never;
   page?: TraceQueryRequest['page'];
   pagination?: never;
   mode?: never;
@@ -308,8 +309,8 @@ export class Observability extends BaseResource {
    *
    * Grouped results remain supported but are deprecated. Use `queryTraceThreads()` to retrieve thread identities.
    *
-   * Set `include: { tableSummary: true }` to receive the bounded Traces-table fields on every row: output preview,
-   * tags, model, time to first token, error counts, prompt-cache tokens, and newest-first feedback and score summaries.
+   * Set `select` to add fields to every row, such as `outputPreview`, `errorPreview`, or `errorCounts`, and
+   * `include` to add each trace's per-scorer averages or newest feedback. Each field costs a query only when selected.
    *
    * @param params - Advanced trace query, including its required time range
    * @returns Matching lightweight traces
