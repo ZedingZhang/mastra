@@ -79,7 +79,6 @@ export {
   getTraceQueryDeltaWatermark,
   planTraceQuerySelectionPredicate,
   normalizeTraceQueryPath,
-  TRACE_QUERY_FEEDBACK_LIMIT,
   TRACE_QUERY_SELECT_MAX_PAGE_SIZE,
   TRACE_QUERY_TIMESTAMP_PATTERN,
   parseTraceQueryTimestamp,
@@ -90,12 +89,11 @@ export {
   TRACE_QUERY_SELECT_LLM_SPAN_TYPES,
   TRACE_QUERY_SELECT_TOOL_SPAN_TYPES,
   TRACE_QUERY_SELECT_FIELDS,
-  traceQueryFeedbackSummarySchema,
+  TRACE_QUERY_SCORER_LIMIT,
   traceQueryScoreSummarySchema,
   traceQuerySelectionSchema,
   traceQuerySelectionNeeds,
   buildTraceQuerySelection,
-  compareTraceQueryNewestFirst,
 } from './trace-query';
 export type {
   TraceQueryLiteral,
@@ -166,7 +164,6 @@ export type {
   TraceQuerySelection,
   TraceQuerySelectionNeeds,
   TraceQuerySelectionInput,
-  TraceQueryFeedbackSummary,
   TraceQueryScoreSummary,
 } from './trace-query';
 export * from './tracing';

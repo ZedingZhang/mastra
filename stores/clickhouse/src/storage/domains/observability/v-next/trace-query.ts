@@ -889,7 +889,6 @@ type SelectionRollup = NonNullable<coreStorage.TraceQuerySelectionInput['spans']
 
 interface SelectionRows {
   rollups: Map<string, SelectionRollup>;
-  feedback: Map<string, coreStorage.TraceQueryFeedbackSummary[]>;
   scores: Map<string, coreStorage.TraceQueryScoreSummary[]>;
 }
 
@@ -910,7 +909,6 @@ export function compileClickHouseSelectionQueries(
   needs: coreStorage.TraceQuerySelectionNeeds,
 ): {
   rollups?: CompiledClickHouseTraceQuery;
-  feedback?: CompiledClickHouseTraceQuery;
   scores?: CompiledClickHouseTraceQuery;
 } {
   const list = (types: readonly string[]) => types.map(type => `'${type}'`).join(', ');
@@ -1000,40 +998,16 @@ FROM current_spans c
 ${joins.map(join => `${join}\n`).join('')}GROUP BY c.traceId`;
   };
 
-  const feedback = (parameters: ParameterBuilder, ids: string, tenant: string) => `SELECT *
-FROM (
-  SELECT
-    traceId, feedbackId, feedbackType, feedbackSource, valueString, valueNumber, comment, timestamp,
-    row_number() OVER (PARTITION BY traceId ORDER BY timestamp DESC, feedbackId ASC) AS relatedRank
-  FROM (
-    SELECT *
-    FROM ${TABLE_FEEDBACK_EVENTS} FINAL
-    -- ClickHouse cannot push the trace filter through LIMIT 1 BY, so keep every version of
-    -- each feedbackId that ever pointed at one of these traces. A rewrite can move a record
-    -- to another trace, and only its current version belongs on this page.
-    WHERE feedbackId IN (
-      SELECT feedbackId
-      FROM ${TABLE_FEEDBACK_EVENTS}
-      WHERE traceId IN ${ids}
-    )
-    ORDER BY feedbackId, writeVersion DESC, timestamp DESC
-    LIMIT 1 BY feedbackId
-  ) AS current
-  WHERE traceId IN ${ids}${tenant}
-)
-WHERE relatedRank <= ${parameters.add(coreStorage.TRACE_QUERY_FEEDBACK_LIMIT + 1, 'UInt64')}
-ORDER BY traceId ASC, relatedRank ASC`;
-
-  const scores = (_parameters: ParameterBuilder, ids: string, tenant: string) => `SELECT
+  const scores = (parameters: ParameterBuilder, ids: string, tenant: string) => `SELECT
   traceId, scorerId, avg(score) AS average, count() AS count
 FROM ${currentScoresRelation()} AS current
 WHERE traceId IN ${ids}${tenant}
 GROUP BY traceId, scorerId
-ORDER BY traceId ASC, scorerId ASC`;
+ORDER BY traceId ASC, scorerId ASC
+LIMIT ${parameters.add(coreStorage.TRACE_QUERY_SCORER_LIMIT + 1, 'UInt64')} BY traceId`;
 
   return {
     ...(needs.spans ? { rollups: compile(rollups) } : {}),
-    ...(needs.feedback ? { feedback: compile(feedback) } : {}),
     ...(needs.scores ? { scores: compile(scores) } : {}),
   };
 }
@@ -1050,16 +1024,12 @@ async function loadSelectionRows(
   needs: coreStorage.TraceQuerySelectionNeeds,
   timeoutMs: () => number,
 ): Promise<SelectionRows> {
-  const result: SelectionRows = { rollups: new Map(), feedback: new Map(), scores: new Map() };
+  const result: SelectionRows = { rollups: new Map(), scores: new Map() };
   if (traceIds.length === 0) return result;
   const queries = compileClickHouseSelectionQueries(scope, traceIds, from, needs);
   const run = (query?: CompiledClickHouseTraceQuery) =>
     query ? runWithClickHouseTraceQueryTimeout(client, { timeoutMs: timeoutMs() }, query) : Promise.resolve([]);
-  const [rollupRows, feedbackRows, scoreRows] = await Promise.all([
-    run(queries.rollups),
-    run(queries.feedback),
-    run(queries.scores),
-  ]);
+  const [rollupRows, scoreRows] = await Promise.all([run(queries.rollups), run(queries.scores)]);
   for (const row of rollupRows) {
     result.rollups.set(String(row.traceId), {
       errorTotal: Number(row.errorTotal ?? 0),
@@ -1070,19 +1040,6 @@ async function loadSelectionRows(
       promptCacheReadTokens: nullableNumber(row.promptCacheReadTokens),
       promptCacheCreationTokens: nullableNumber(row.promptCacheCreationTokens),
     });
-  }
-  for (const row of feedbackRows) {
-    const traceId = String(row.traceId);
-    const records = result.feedback.get(traceId) ?? [];
-    records.push({
-      feedbackId: String(row.feedbackId),
-      feedbackType: String(row.feedbackType),
-      feedbackSource: String(row.feedbackSource),
-      value: row.valueNumber != null ? Number(row.valueNumber) : String(row.valueString ?? ''),
-      comment: row.comment == null ? null : String(row.comment),
-      timestamp: asIsoTimestamp(row.timestamp),
-    });
-    result.feedback.set(traceId, records);
   }
   for (const row of scoreRows) {
     const traceId = String(row.traceId);
@@ -1122,7 +1079,6 @@ function traceRowToResult(row: Record<string, unknown>, plan?: TrustedTraceQuery
           promptCacheReadTokens: rollup?.promptCacheReadTokens ?? null,
           promptCacheCreationTokens: rollup?.promptCacheCreationTokens ?? null,
           scores: selection.scores.get(traceId) ?? [],
-          feedback: selection.feedback.get(traceId) ?? [],
         })
       : {}),
   };

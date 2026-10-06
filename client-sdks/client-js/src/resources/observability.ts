@@ -310,7 +310,7 @@ export class Observability extends BaseResource {
    * Grouped results remain supported but are deprecated. Use `queryTraceThreads()` to retrieve thread identities.
    *
    * Set `select` to add fields to every row, such as `outputPreview`, `errorPreview`, or `errorCounts`, and
-   * `include` to add each trace's per-scorer averages or newest feedback. Each field costs a query only when selected.
+   * `include: { scores: true }` to add one average per scorer. Each field costs a query only when selected.
    *
    * @param params - Advanced trace query, including its required time range
    * @returns Matching lightweight traces

@@ -13,6 +13,7 @@ import {
   planTraceQuery,
   planTraceQueryObservedFields,
   planTraceQueryValues,
+  TRACE_QUERY_SCORER_LIMIT,
   TRACE_QUERY_SELECT_FIELDS,
   traceQuerySelectionSchema,
 } from '@mastra/core/storage';
@@ -713,8 +714,7 @@ export function createObservabilityVNextTests(options: CreateObservabilityVNextT
           { select: ['model', 'timeToFirstTokenMs'] },
           { select: ['promptCacheReadTokens', 'promptCacheCreationTokens'] },
           { include: { scores: true } },
-          { include: { feedback: true } },
-          { select: [...TRACE_QUERY_SELECT_FIELDS], include: { scores: true, feedback: true } },
+          { select: [...TRACE_QUERY_SELECT_FIELDS], include: { scores: true } },
         ];
         for (const request of requests) {
           const plain = await storage.queryTraces(planTraceQuery(parseTraceQueryRequest(request)));
@@ -740,7 +740,7 @@ export function createObservabilityVNextTests(options: CreateObservabilityVNextT
           }
         }
 
-        const all = { select: [...TRACE_QUERY_SELECT_FIELDS], include: { scores: true, feedback: true } } as const;
+        const all = { select: [...TRACE_QUERY_SELECT_FIELDS], include: { scores: true } } as const;
         const firstPage = await storage.queryTraces(
           planTraceQuery(parseTraceQueryRequest({ timeRange, page: { limit: 2 }, ...all })),
         );
@@ -766,8 +766,26 @@ export function createObservabilityVNextTests(options: CreateObservabilityVNextT
             { scorerId: 'scorer-1', average: 0.34375, count: 4 },
             { scorerId: 'scorer-2', average: 0.3125, count: 3 },
           ],
-          feedbackTruncated: false,
+          scoresTruncated: false,
         });
+        const capped = await storage.queryTraces(
+          planTraceQuery(
+            parseTraceQueryRequest({
+              timeRange,
+              where: { op: 'eq', left: { path: 'traceId' }, right: { literal: 'summary-b' } },
+              page: { limit: 1 },
+              include: { scores: true },
+            }),
+          ),
+        );
+        if (!('traces' in capped)) throw new Error('Expected trace results');
+        const cappedScores = capped.traces[0]!.scores!;
+        expect(cappedScores).toHaveLength(TRACE_QUERY_SCORER_LIMIT);
+        expect(capped.traces[0]!.scoresTruncated).toBe(true);
+        // Byte order puts `Zeta` and `alpha` before every `scorer-NN`, so the cap drops `scorer-48`
+        // and `scorer-49`. A locale order would put `Zeta` last and drop it instead.
+        expect(cappedScores.slice(0, 2).map(score => score.scorerId)).toEqual(['Zeta', 'alpha']);
+        expect(cappedScores.at(-1)!.scorerId).toBe('scorer-47');
       });
 
       it('adds selected fields while polling trace deltas', async () => {
@@ -776,7 +794,7 @@ export function createObservabilityVNextTests(options: CreateObservabilityVNextT
         coreFeatures.add(feature);
         try {
           const timeRange = TRACE_QUERY_SELECT_TIME_RANGE;
-          const all = { select: [...TRACE_QUERY_SELECT_FIELDS], include: { scores: true, feedback: true } } as const;
+          const all = { select: [...TRACE_QUERY_SELECT_FIELDS], include: { scores: true } } as const;
           const bootstrap = await storage.queryTraces(
             planTraceQuery(parseTraceQueryRequest({ timeRange, mode: 'delta', ...all })),
           );

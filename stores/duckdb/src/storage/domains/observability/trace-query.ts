@@ -871,7 +871,6 @@ type SelectionRollup = NonNullable<coreStorage.TraceQuerySelectionInput['spans']
 
 interface SelectionRows {
   rollups: Map<string, SelectionRollup>;
-  feedback: Map<string, coreStorage.TraceQueryFeedbackSummary[]>;
   scores: Map<string, coreStorage.TraceQueryScoreSummary[]>;
 }
 
@@ -891,7 +890,6 @@ export function compileDuckDBSelectionQueries(
   needs: coreStorage.TraceQuerySelectionNeeds,
 ): {
   rollups?: CompiledDuckDBTraceQuery;
-  feedback?: CompiledDuckDBTraceQuery;
   scores?: CompiledDuckDBTraceQuery;
 } {
   const ids = traceIds.map(() => '?').join(', ');
@@ -1000,34 +998,24 @@ ${joins.map(join => `${join}\n`).join('')}GROUP BY c.traceId`,
     };
   };
 
-  const feedbackWhere = where('f');
-  const feedback: CompiledDuckDBTraceQuery = {
-    sql: `SELECT *
-FROM (
-  SELECT
-    f.traceId, f.feedbackId, f.feedbackType, f.feedbackSource, f.value, f.valueString, f.valueNumber, f.comment, f.timestamp,
-    row_number() OVER (PARTITION BY f.traceId ORDER BY f.timestamp DESC, f.feedbackId ASC) AS relatedRank
-  FROM feedback_events f
-  WHERE ${feedbackWhere.sql}
-)
-WHERE relatedRank <= ?
-ORDER BY traceId ASC, relatedRank ASC`,
-    values: [...feedbackWhere.values, coreStorage.TRACE_QUERY_FEEDBACK_LIMIT + 1],
-  };
-
   const scoreWhere = where('s');
   const scores: CompiledDuckDBTraceQuery = {
-    sql: `SELECT s.traceId, s.scorerId, avg(s.score) AS average, count(*) AS count
-FROM score_events s
-WHERE ${scoreWhere.sql}
-GROUP BY s.traceId, s.scorerId
-ORDER BY s.traceId ASC, s.scorerId ASC`,
-    values: scoreWhere.values,
+    sql: `SELECT traceId, scorerId, average, count
+FROM (
+  SELECT
+    s.traceId, s.scorerId, avg(s.score) AS average, count(*) AS count,
+    row_number() OVER (PARTITION BY s.traceId ORDER BY s.scorerId) AS scorerRank
+  FROM score_events s
+  WHERE ${scoreWhere.sql}
+  GROUP BY s.traceId, s.scorerId
+)
+WHERE scorerRank <= ?
+ORDER BY traceId ASC, scorerRank ASC`,
+    values: [...scoreWhere.values, coreStorage.TRACE_QUERY_SCORER_LIMIT + 1],
   };
 
   return {
     ...(needs.spans ? { rollups: compileRollups() } : {}),
-    ...(needs.feedback ? { feedback } : {}),
     ...(needs.scores ? { scores } : {}),
   };
 }
@@ -1043,16 +1031,12 @@ async function loadSelectionRows(
   from: string,
   needs: coreStorage.TraceQuerySelectionNeeds,
 ): Promise<SelectionRows> {
-  const result: SelectionRows = { rollups: new Map(), feedback: new Map(), scores: new Map() };
+  const result: SelectionRows = { rollups: new Map(), scores: new Map() };
   if (traceIds.length === 0) return result;
   const queries = compileDuckDBSelectionQueries(scope, traceIds, from, needs);
   const run = async (query?: CompiledDuckDBTraceQuery) =>
     query ? db.query<Record<string, unknown>>(query.sql, query.values) : [];
-  const [rollupRows, feedbackRows, scoreRows] = await Promise.all([
-    run(queries.rollups),
-    run(queries.feedback),
-    run(queries.scores),
-  ]);
+  const [rollupRows, scoreRows] = await Promise.all([run(queries.rollups), run(queries.scores)]);
   for (const row of rollupRows) {
     result.rollups.set(String(row.traceId), {
       errorTotal: Number(row.errorTotal ?? 0),
@@ -1063,19 +1047,6 @@ async function loadSelectionRows(
       promptCacheReadTokens: nullableNumber(row.promptCacheReadTokens),
       promptCacheCreationTokens: nullableNumber(row.promptCacheCreationTokens),
     });
-  }
-  for (const row of feedbackRows) {
-    const traceId = String(row.traceId);
-    const records = result.feedback.get(traceId) ?? [];
-    records.push({
-      feedbackId: String(row.feedbackId),
-      feedbackType: String(row.feedbackType),
-      feedbackSource: String(row.feedbackSource),
-      value: row.valueNumber != null ? Number(row.valueNumber) : String(row.valueString ?? row.value ?? ''),
-      comment: row.comment == null ? null : String(row.comment),
-      timestamp: asIsoTimestamp(row.timestamp),
-    });
-    result.feedback.set(traceId, records);
   }
   for (const row of scoreRows) {
     const traceId = String(row.traceId);
@@ -1115,7 +1086,6 @@ function traceRowToResult(row: Record<string, unknown>, plan?: TrustedTraceQuery
           promptCacheReadTokens: rollup?.promptCacheReadTokens ?? null,
           promptCacheCreationTokens: rollup?.promptCacheCreationTokens ?? null,
           scores: selection.scores.get(traceId) ?? [],
-          feedback: selection.feedback.get(traceId) ?? [],
         })
       : {}),
   };

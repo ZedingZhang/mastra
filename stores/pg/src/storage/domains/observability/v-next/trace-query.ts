@@ -956,7 +956,6 @@ type SelectionRollup = NonNullable<coreStorage.TraceQuerySelectionInput['spans']
 
 interface SelectionRows {
   rollups: Map<string, SelectionRollup>;
-  feedback: Map<string, coreStorage.TraceQueryFeedbackSummary[]>;
   scores: Map<string, coreStorage.TraceQueryScoreSummary[]>;
 }
 
@@ -977,13 +976,11 @@ export function compilePostgresSelectionQueries(
   needs: coreStorage.TraceQuerySelectionNeeds,
 ): {
   rollups?: CompiledPostgresTraceQuery;
-  feedback?: CompiledPostgresTraceQuery;
   scores?: CompiledPostgresTraceQuery;
 } {
   const spanTable = qualifiedTable(schema, TABLE_SPAN_EVENTS);
   const metricTable = qualifiedTable(schema, TABLE_METRIC_EVENTS);
   const scoreTable = qualifiedTable(schema, TABLE_SCORE_EVENTS);
-  const feedbackTable = qualifiedTable(schema, TABLE_FEEDBACK_EVENTS);
   const list = (types: readonly string[]) => types.map(type => `'${type}'`).join(', ');
 
   // $1 is always the trace ID array; tenant scope binds the next positions.
@@ -1083,34 +1080,25 @@ ${joins.map(join => `${join}\n`).join('')}GROUP BY c."traceId"`,
     };
   };
 
-  const feedback: CompiledPostgresTraceQuery = {
-    text: `SELECT *
+  const scores: CompiledPostgresTraceQuery = {
+    // Byte order, like the other stores and the shared builder, so the same scorers survive the cap.
+    text: `SELECT "traceId", "scorerId", "average", "count"
 FROM (
   SELECT
-    s."traceId", s."feedbackId", s."feedbackType", s."feedbackSource", s."valueString", s."valueNumber", s."comment", s."timestamp",
-    row_number() OVER (PARTITION BY s."traceId" ORDER BY s."timestamp" DESC, s."feedbackId" ASC) AS "relatedRank"
-  FROM ${feedbackTable} s
+    s."traceId", s."scorerId", avg(s."score") AS "average", count(*) AS "count",
+    row_number() OVER (PARTITION BY s."traceId" ORDER BY s."scorerId" COLLATE "C") AS "scorerRank"
+  FROM ${scoreTable} s
   WHERE s."traceId" = ANY($1::text[])
-    AND ${latestFeedbackPredicate(feedbackTable)}${scopeSql('s')}
+    AND ${latestScorePredicate(scoreTable)}${scopeSql('s')}
+  GROUP BY s."traceId", s."scorerId"
 ) ranked
-WHERE "relatedRank" <= $${values.length + 1}
-ORDER BY "traceId" ASC, "relatedRank" ASC`,
-    values: [...values, coreStorage.TRACE_QUERY_FEEDBACK_LIMIT + 1],
-  };
-
-  const scores: CompiledPostgresTraceQuery = {
-    text: `SELECT s."traceId", s."scorerId", avg(s."score") AS "average", count(*) AS "count"
-FROM ${scoreTable} s
-WHERE s."traceId" = ANY($1::text[])
-  AND ${latestScorePredicate(scoreTable)}${scopeSql('s')}
-GROUP BY s."traceId", s."scorerId"
-ORDER BY s."traceId" ASC, s."scorerId" ASC`,
-    values,
+WHERE "scorerRank" <= $${values.length + 1}
+ORDER BY "traceId" ASC, "scorerRank" ASC`,
+    values: [...values, coreStorage.TRACE_QUERY_SCORER_LIMIT + 1],
   };
 
   return {
     ...(needs.spans ? { rollups: compileRollups() } : {}),
-    ...(needs.feedback ? { feedback } : {}),
     ...(needs.scores ? { scores } : {}),
   };
 }
@@ -1136,7 +1124,7 @@ async function loadSelectionRows(
   needs: coreStorage.TraceQuerySelectionNeeds,
   deadline?: number,
 ): Promise<SelectionRows> {
-  const result: SelectionRows = { rollups: new Map(), feedback: new Map(), scores: new Map() };
+  const result: SelectionRows = { rollups: new Map(), scores: new Map() };
   if (traceIds.length === 0) return result;
   const queries = compilePostgresSelectionQueries(schema, scope, traceIds, from, needs);
   // `statement_timeout` is per statement, so re-derive the remaining budget before each one.
@@ -1146,7 +1134,6 @@ async function loadSelectionRows(
     return transaction.any<Record<string, unknown>>(query.text, query.values);
   };
   const rollupRows = await run(queries.rollups);
-  const feedbackRows = await run(queries.feedback);
   const scoreRows = await run(queries.scores);
   for (const row of rollupRows) {
     result.rollups.set(String(row.traceId), {
@@ -1160,19 +1147,6 @@ async function loadSelectionRows(
       promptCacheReadTokens: nullableNumber(row.promptCacheReadTokens),
       promptCacheCreationTokens: nullableNumber(row.promptCacheCreationTokens),
     });
-  }
-  for (const row of feedbackRows) {
-    const traceId = String(row.traceId);
-    const records = result.feedback.get(traceId) ?? [];
-    records.push({
-      feedbackId: String(row.feedbackId),
-      feedbackType: String(row.feedbackType),
-      feedbackSource: String(row.feedbackSource),
-      value: row.valueNumber != null ? Number(row.valueNumber) : String(row.valueString ?? ''),
-      comment: row.comment == null ? null : String(row.comment),
-      timestamp: asIsoTimestamp(row.timestamp),
-    });
-    result.feedback.set(traceId, records);
   }
   for (const row of scoreRows) {
     const traceId = String(row.traceId);
@@ -1212,7 +1186,6 @@ function traceRowToResult(row: Record<string, unknown>, plan?: TrustedTraceQuery
           promptCacheReadTokens: rollup?.promptCacheReadTokens ?? null,
           promptCacheCreationTokens: rollup?.promptCacheCreationTokens ?? null,
           scores: selection.scores.get(traceId) ?? [],
-          feedback: selection.feedback.get(traceId) ?? [],
         })
       : {}),
   };

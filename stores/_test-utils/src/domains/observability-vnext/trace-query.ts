@@ -1,7 +1,6 @@
 import { coreFeatures } from '@mastra/core/features';
 import {
   buildTraceQuerySelection,
-  compareTraceQueryNewestFirst,
   parseTraceQueryTimestamp,
   traceQuerySelectFrom,
   compareTraceQueryStrings,
@@ -10,7 +9,6 @@ import {
   TRACE_QUERY_SELECT_LLM_SPAN_TYPES,
   TRACE_QUERY_SELECT_METRICS,
   TRACE_QUERY_SELECT_MODEL_SPAN_TYPES,
-  TRACE_QUERY_FEEDBACK_LIMIT,
   TRACE_QUERY_SELECT_TOOL_SPAN_TYPES,
   getTraceQueryDeltaWatermark,
   isTraceAggregateCanonicalDimension,
@@ -1107,12 +1105,12 @@ const summaryMetric = (
 
 /**
  * `select` and `include` fixture. `summary-a` exercises every field: a replaced model
- * span, LLM and tool errors, tags, feedback, several scorers scoring both the root and a span,
+ * span, LLM and tool errors, tags, several scorers scoring both the root and a span,
  * a rewritten score, and cache-token metrics including rows the selection must
  * ignore, a retried metric row, and a span whose clock runs behind the root's. `summary-b` is a
- * failed root whose error carries a class and a stack. `summary-c` has an earliest model span without a model and
- * with an unparseable first-token time, a later complete one, rewritten feedback, and a feedback
- * record rewritten onto it from `summary-a`.
+ * failed root whose error carries a class and a stack, with more scorers than the per-trace cap.
+ * `summary-c` has an earliest model span without a model and with an unparseable first-token
+ * time, and a later complete one.
  */
 export const TRACE_QUERY_SELECT_FIXTURE_DATA: TraceQueryFixtureData = {
   spans: [
@@ -1238,39 +1236,22 @@ export const TRACE_QUERY_SELECT_FIXTURE_DATA: TraceQueryFixtureData = {
       timestamp: selectStartedAt(6500),
       scoreSource: 'automated',
     }),
+    // More scorers than the per-trace cap. `Zeta` sorts first in byte order but last in most
+    // locales, so a store that sorts by locale keeps a different 50.
+    ...Array.from({ length: 50 }, (_, index) =>
+      scoreRecord(400 + index, `score-b-${index}`, 'summary-b', `scorer-${String(index).padStart(2, '0')}`, 0.5, {
+        timestamp: selectStartedAt(12_000),
+      }),
+    ),
+    scoreRecord(450, 'score-b-zeta', 'summary-b', 'Zeta', 0.25, { timestamp: selectStartedAt(12_000) }),
+    scoreRecord(451, 'score-b-alpha', 'summary-b', 'alpha', 0.25, { timestamp: selectStartedAt(12_000) }),
     scoreRecord(202, 'score-c-1', 'summary-c', 'factuality', 0.42, {
       timestamp: selectStartedAt(25_000),
       scorerVersion: '2.0',
       scoreSource: 'human',
     }),
   ],
-  feedback: [
-    feedbackRecord(300, 'feedback-a-1', 'summary-a', 'thumbs_down', 'patient', 0, {
-      timestamp: selectStartedAt(7000),
-      comment: 'Interaction omitted',
-    }),
-    feedbackRecord(301, 'feedback-a-2', 'summary-a', 'rating', 'clinician', 'helpful', {
-      timestamp: selectStartedAt(8000),
-    }),
-    feedbackRecord(302, 'feedback-c-1', 'summary-c', 'rating', 'user', 3, {
-      timestamp: selectStartedAt(26_000),
-      comment: 'first draft',
-    }),
-    feedbackRecord(303, 'feedback-c-1', 'summary-c', 'rating', 'user', 5, {
-      timestamp: selectStartedAt(26_000),
-      comment: 'revised',
-    }),
-    // Rewritten onto another trace: only the current version belongs in a summary, so this
-    // record counts for `summary-c` and must not reappear under `summary-a`.
-    feedbackRecord(304, 'feedback-moved', 'summary-a', 'thumbs_up', 'patient', 1, {
-      timestamp: selectStartedAt(7500),
-      comment: 'filed against the wrong trace',
-    }),
-    feedbackRecord(305, 'feedback-moved', 'summary-c', 'thumbs_up', 'patient', 1, {
-      timestamp: selectStartedAt(27_000),
-      comment: 'filed against the wrong trace',
-    }),
-  ],
+  feedback: [],
   metrics: [
     summaryMetric('metric-a-read-1', 'summary-a', 'model-a-1', 'mastra_model_input_cache_read_tokens', 1000, 1500),
     // Exporter retry: the same metricId arrives again later and must be counted once.
@@ -2831,12 +2812,11 @@ export function evaluateTraceQuery(data: TraceQueryFixtureData, plan: TrustedTra
   const head = data.spans.reduce((max, row) => (row.parentSpanId === null ? Math.max(max, row.cursorId) : max), 0);
   const spans = currentSpans(data.spans).filter(span => matchesScope(span, plan.scope));
   const scores = currentScores(data.scores).filter(score => matchesScope(score, plan.scope));
-  const feedback = currentFeedback(data.feedback).filter(record => matchesScope(record, plan.scope));
   const toTrace = (root: RawTraceQuerySpan): TraceQueryTrace =>
     plan.select || plan.include
       ? {
           ...toTraceQueryTrace(root),
-          ...evaluateSelection(plan, root, spans, scores, feedback, data.metrics, traceQuerySelectFrom(plan.timeRange)),
+          ...evaluateSelection(plan, root, spans, scores, data.metrics, traceQuerySelectFrom(plan.timeRange)),
         }
       : toTraceQueryTrace(root);
   if (plan.paginationMode === 'delta') {
@@ -3251,12 +3231,11 @@ function evaluateSelection(
   root: RawTraceQuerySpan,
   spans: RawTraceQuerySpan[],
   scores: RawTraceQueryScore[],
-  feedback: RawTraceQueryFeedback[],
   metrics: RawTraceQueryMetric[] = [],
   from = '',
 ): TraceQuerySelection {
-  // Spans and metrics are read from `from`, a day before the requested window; feedback and
-  // scores are not, because a reviewer can add them at any time afterwards.
+  // Spans and metrics are read from `from`, a day before the requested window; scores are not,
+  // because a reviewer can add them at any time afterwards.
   const traceSpans = spans.filter(span => span.traceId === root.traceId && (span.endedAt ?? '') >= from);
   const modelSpan = traceSpans
     .filter(span => TRACE_QUERY_SELECT_MODEL_SPAN_TYPES.includes(span.spanType))
@@ -3304,23 +3283,6 @@ function evaluateSelection(
       model: typeof model === 'string' ? model : null,
       timeToFirstTokenMs,
     },
-    feedback: feedback
-      .filter(record => record.traceId === root.traceId)
-      .map(record => ({
-        feedbackId: record.feedbackId,
-        feedbackType: record.feedbackType,
-        feedbackSource: record.feedbackSource,
-        value: record.value,
-        comment: record.comment,
-        timestamp: record.timestamp,
-      }))
-      .sort((left, right) =>
-        compareTraceQueryNewestFirst(
-          { timestamp: left.timestamp, id: left.feedbackId },
-          { timestamp: right.timestamp, id: right.feedbackId },
-        ),
-      )
-      .slice(0, TRACE_QUERY_FEEDBACK_LIMIT + 1),
     scores: [...scorers].map(([scorerId, { total, count }]) => ({ scorerId, average: total / count, count })),
     promptCacheReadTokens: sumMetric(TRACE_QUERY_SELECT_METRICS.promptCacheReadTokens),
     promptCacheCreationTokens: sumMetric(TRACE_QUERY_SELECT_METRICS.promptCacheCreationTokens),

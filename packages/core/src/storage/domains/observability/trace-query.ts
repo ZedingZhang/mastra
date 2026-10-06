@@ -24,8 +24,8 @@ export const TRACE_QUERY_DISCOVERY_MAX_LIMIT = 100;
 export const TRACE_QUERY_DISCOVERY_MAX_SEARCH_LENGTH = 256;
 export const TRACE_QUERY_DEFAULT_TIMEOUT_MS = 15_000;
 export const TRACE_QUERY_MAX_TIMEOUT_MS = 300_000;
-/** Maximum feedback records returned per trace by `include.feedback`. */
-export const TRACE_QUERY_FEEDBACK_LIMIT = 10;
+/** Maximum scorers returned per trace by `include.scores`, ordered by `scorerId`. */
+export const TRACE_QUERY_SCORER_LIMIT = 50;
 /** Largest page `select` and `include` enrich, bounding the side-query work per request. */
 export const TRACE_QUERY_SELECT_MAX_PAGE_SIZE = 100;
 
@@ -405,15 +405,13 @@ const traceQueryRequestObjectSchema = z
       .object({
         /** One average per scorer, over the trace's current scores. */
         scores: z.boolean().optional(),
-        /** The trace's newest current feedback records. */
-        feedback: z.boolean().optional(),
       })
       .strict()
       .optional(),
   })
   .strict()
   .superRefine((request, context) => {
-    if (request.select?.length || request.include?.scores || request.include?.feedback) {
+    if (request.select?.length || request.include?.scores) {
       const path = request.select?.length ? ['select'] : ['include'];
       if (request.group) {
         context.addIssue({ code: 'custom', path, message: SELECT_GROUP_NOT_SUPPORTED_MESSAGE });
@@ -483,18 +481,10 @@ export const queryThreadsInputSchema = z.preprocess((input, context) => {
   return input;
 }, queryThreadsInputObjectSchema);
 
-export const traceQueryFeedbackSummarySchema = z
-  .object({
-    feedbackId: z.string(),
-    feedbackType: z.string(),
-    feedbackSource: z.string(),
-    value: z.union([z.string(), z.number()]),
-    comment: z.string().nullable(),
-    timestamp: z.string().datetime({ offset: true }),
-  })
-  .strict();
-
-/** One scorer's result on a trace: the average of its current scores, across the root and its spans. */
+/**
+ * One scorer's result on a trace: the average of its current scores, across the root and its spans
+ * and across scorer versions, so a table shows one column per scorer.
+ */
 export const traceQueryScoreSummarySchema = z
   .object({
     scorerId: z.string(),
@@ -524,11 +514,9 @@ export const traceQuerySelectionSchema = z
     promptCacheReadTokens: z.number().nonnegative().nullable(),
     promptCacheCreationTokens: z.number().nonnegative().nullable(),
     /** One entry per scorer, ordered by `scorerId`. */
-    scores: z.array(traceQueryScoreSummarySchema),
-    /** Newest first, with `feedbackId` as the tie-breaker. */
-    feedback: z.array(traceQueryFeedbackSummarySchema).max(TRACE_QUERY_FEEDBACK_LIMIT),
-    /** `true` when the trace has more feedback than `feedback` holds. */
-    feedbackTruncated: z.boolean(),
+    scores: z.array(traceQueryScoreSummarySchema).max(TRACE_QUERY_SCORER_LIMIT),
+    /** `true` when the trace has more scorers than `scores` holds. */
+    scoresTruncated: z.boolean(),
   })
   .partial()
   .strict();
@@ -639,7 +627,6 @@ export type TraceQueryRequest = Omit<TraceQueryRequestInput, 'group'> & {
 export type NormalizedTraceQueryRequest = z.output<typeof traceQueryRequestObjectSchema>;
 export type TraceQueryTrace = z.infer<typeof traceQueryTraceSchema>;
 export type TraceQuerySelection = z.infer<typeof traceQuerySelectionSchema>;
-export type TraceQueryFeedbackSummary = z.infer<typeof traceQueryFeedbackSummarySchema>;
 export type TraceQueryScoreSummary = z.infer<typeof traceQueryScoreSummarySchema>;
 export type TraceQueryTraceResponse = z.infer<typeof traceQueryTraceResponseSchema>;
 export type TraceQueryPaginatedTraceResponse = z.infer<typeof traceQueryPaginatedTraceResponseSchema>;
@@ -866,7 +853,7 @@ interface TrustedTraceQueryTracesBasePlan extends TrustedTraceQueryBasePlan {
    */
   select?: TraceQuerySelectField[];
   /** Related records to add to the page's rows. */
-  include?: { scores?: true; feedback?: true };
+  include?: { scores?: true };
 }
 
 export type TrustedTraceQueryKeysetTracesPlan = TrustedTraceQueryTracesBasePlan &
@@ -1281,13 +1268,9 @@ export function planTraceQuery(
   const result = 'traces' as const;
   const orderBy = request.orderBy?.[0] ?? ({ field: 'startedAt', direction: 'desc' } as const);
   const select = TRACE_QUERY_SELECT_FIELDS.filter(field => request.select?.includes(field));
-  const include = {
-    ...(request.include?.scores ? { scores: true as const } : {}),
-    ...(request.include?.feedback ? { feedback: true as const } : {}),
-  };
   const selection = {
     ...(select.length ? { select } : {}),
-    ...(Object.keys(include).length ? { include } : {}),
+    ...(request.include?.scores ? { include: { scores: true as const } } : {}),
   };
   const deltaBinding = digestBinding({
     timeRange,
@@ -1361,7 +1344,6 @@ export interface TraceQuerySelectionNeeds {
   model: boolean;
   metrics: boolean;
   scores: boolean;
-  feedback: boolean;
 }
 
 /**
@@ -1372,7 +1354,7 @@ export interface TraceQuerySelectionNeeds {
  */
 export function traceQuerySelectionNeeds(plan: {
   select?: readonly TraceQuerySelectField[];
-  include?: { scores?: true; feedback?: true };
+  include?: { scores?: true };
 }): TraceQuerySelectionNeeds {
   const selected = (field: TraceQuerySelectField) => plan.select?.includes(field) ?? false;
   const errorCounts = selected('errorCounts');
@@ -1387,7 +1369,6 @@ export function traceQuerySelectionNeeds(plan: {
     model,
     metrics,
     scores: plan.include?.scores ?? false,
-    feedback: plan.include?.feedback ?? false,
   };
 }
 
@@ -1410,10 +1391,8 @@ export interface TraceQuerySelectionInput {
   /** Summed metric values per trace; null when no metric row exists. */
   promptCacheReadTokens?: number | null;
   promptCacheCreationTokens?: number | null;
-  /** One average per scorer, in any order. */
+  /** One average per scorer, the first `TRACE_QUERY_SCORER_LIMIT + 1` by `scorerId`. */
   scores?: TraceQueryScoreSummary[];
-  /** Newest-first current feedback, at most `TRACE_QUERY_FEEDBACK_LIMIT + 1` rows. */
-  feedback?: TraceQueryFeedbackSummary[];
 }
 
 function normalizeTags(tags: unknown): string[] {
@@ -1436,7 +1415,7 @@ function normalizeTags(tags: unknown): string[] {
  * @internal Storage boundary helper.
  */
 export function buildTraceQuerySelection(
-  plan: { select?: readonly TraceQuerySelectField[]; include?: { scores?: true; feedback?: true } },
+  plan: { select?: readonly TraceQuerySelectField[]; include?: { scores?: true } },
   input: TraceQuerySelectionInput,
 ): TraceQuerySelection {
   const spans = input.spans ?? null;
@@ -1460,25 +1439,13 @@ export function buildTraceQuerySelection(
   const selection: Record<string, unknown> = {};
   for (const field of plan.select ?? []) selection[field] = values[field]();
   if (plan.include?.scores) {
-    selection.scores = [...(input.scores ?? [])].sort((left, right) =>
+    const scores = [...(input.scores ?? [])].sort((left, right) =>
       compareTraceQueryStrings(left.scorerId, right.scorerId),
     );
-  }
-  if (plan.include?.feedback) {
-    const feedback = input.feedback ?? [];
-    selection.feedback = feedback.slice(0, TRACE_QUERY_FEEDBACK_LIMIT);
-    selection.feedbackTruncated = feedback.length > TRACE_QUERY_FEEDBACK_LIMIT;
+    selection.scores = scores.slice(0, TRACE_QUERY_SCORER_LIMIT);
+    selection.scoresTruncated = scores.length > TRACE_QUERY_SCORER_LIMIT;
   }
   return selection as TraceQuerySelection;
-}
-
-/** Deterministic newest-first order for feedback; ties break on the record ID. */
-export function compareTraceQueryNewestFirst(
-  left: { timestamp: string; id: string },
-  right: { timestamp: string; id: string },
-): number {
-  const byTimestamp = compareTraceQueryStrings(right.timestamp, left.timestamp);
-  return byTimestamp !== 0 ? byTimestamp : compareTraceQueryStrings(left.id, right.id);
 }
 
 /**

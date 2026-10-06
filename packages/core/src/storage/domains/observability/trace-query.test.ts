@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import { ObservabilityStorage } from './base';
 import {
   buildTraceQuerySelection,
-  compareTraceQueryNewestFirst,
   compareTraceQueryStrings,
   createTraceQueryObservedFieldDescriptor,
   encodeTraceQueryCursor,
@@ -36,7 +35,7 @@ import {
   TRACE_QUERY_MAX_STRING_BYTES,
   TRACE_QUERY_MAX_TIMEOUT_MS,
   TRACE_QUERY_SELECT_MAX_PAGE_SIZE,
-  TRACE_QUERY_FEEDBACK_LIMIT,
+  TRACE_QUERY_SCORER_LIMIT,
   TRACE_QUERY_SELECT_FIELDS,
   queryThreadsInputSchema,
   traceQuerySelectionNeeds,
@@ -1980,17 +1979,18 @@ describe('select and include', () => {
     if (plain.result !== 'traces' || keyset.result !== 'traces') throw new Error('Expected trace plans');
     if (plain.paginationMode !== 'keyset' || keyset.paginationMode !== 'keyset') throw new Error('Expected keyset');
     expect(keyset.binding).toBe(plain.binding);
-    const empty = planTraceQuery(parsed({ ...baseRequest, select: [], include: { scores: false, feedback: false } }));
+    const empty = planTraceQuery(parsed({ ...baseRequest, select: [], include: { scores: false } }));
     expect(empty).not.toHaveProperty('select');
     expect(empty).not.toHaveProperty('include');
   });
 
   it('rejects unknown fields, grouped queries, and oversized pages before planning', () => {
     expect(traceQueryRequestSchema.safeParse({ ...baseRequest, select: ['input'] }).success).toBe(false);
+    expect(traceQueryRequestSchema.safeParse({ ...baseRequest, include: { feedback: true } }).success).toBe(false);
     const grouped = validationError(() => parsed({ ...withSelect, group: { by: ['threadId'] } }));
     expect(grouped.issues).toContainEqual(expect.objectContaining({ code: 'select_not_supported', path: ['select'] }));
     const large = validationError(() =>
-      parsed({ ...baseRequest, include: { feedback: true }, page: { limit: TRACE_QUERY_SELECT_MAX_PAGE_SIZE + 1 } }),
+      parsed({ ...baseRequest, include: { scores: true }, page: { limit: TRACE_QUERY_SELECT_MAX_PAGE_SIZE + 1 } }),
     );
     expect(large.issues).toContainEqual(expect.objectContaining({ code: 'select_page_too_large', path: ['include'] }));
     expect(parsed({ ...withSelect, page: { limit: TRACE_QUERY_SELECT_MAX_PAGE_SIZE } })).toBeTruthy();
@@ -1999,7 +1999,7 @@ describe('select and include', () => {
 
   it('runs only the side queries the selected fields pay for', () => {
     const none = { output: false, tags: false, error: false, spans: false, errorCounts: false, model: false };
-    expect(traceQuerySelectionNeeds({})).toEqual({ ...none, metrics: false, scores: false, feedback: false });
+    expect(traceQuerySelectionNeeds({})).toEqual({ ...none, metrics: false, scores: false });
     expect(traceQuerySelectionNeeds({ select: ['outputPreview', 'tags', 'errorPreview'] })).toMatchObject({
       output: true,
       tags: true,
@@ -2012,25 +2012,15 @@ describe('select and include', () => {
       model: true,
       metrics: false,
     });
-    expect(traceQuerySelectionNeeds({ select: ['promptCacheReadTokens'], include: { feedback: true } })).toMatchObject({
+    expect(traceQuerySelectionNeeds({ select: ['promptCacheReadTokens'], include: { scores: true } })).toMatchObject({
       spans: true,
       model: false,
       metrics: true,
-      scores: false,
-      feedback: true,
+      scores: true,
     });
   });
 
   it('assembles only the requested fields with shared preview, tag, ordering, and truncation semantics', () => {
-    const record = (id: number) => ({
-      feedbackId: `feedback-${id}`,
-      feedbackType: 'rating',
-      feedbackSource: 'user',
-      value: id,
-      comment: null,
-      timestamp: '2026-08-10T00:00:00.000Z',
-    });
-    const overflow = Array.from({ length: TRACE_QUERY_FEEDBACK_LIMIT + 1 }, (_, i) => record(i));
     const input = {
       output: JSON.stringify({ text: 'The known interaction is with warfarin.', files: [] }),
       tags: '["production", 7, "needs-review"]',
@@ -2041,16 +2031,12 @@ describe('select and include', () => {
         { scorerId: 'helpfulness', average: 0.5, count: 2 },
         { scorerId: 'factuality', average: 0.75, count: 4 },
       ],
-      feedback: overflow,
       promptCacheReadTokens: 1200,
       promptCacheCreationTokens: null,
     };
 
     expect(
-      buildTraceQuerySelection(
-        { select: [...TRACE_QUERY_SELECT_FIELDS], include: { scores: true, feedback: true } },
-        input,
-      ),
+      buildTraceQuerySelection({ select: [...TRACE_QUERY_SELECT_FIELDS], include: { scores: true } }, input),
     ).toEqual({
       outputPreview: 'The known interaction is with warfarin.',
       tags: ['production', 'needs-review'],
@@ -2064,13 +2050,21 @@ describe('select and include', () => {
         { scorerId: 'factuality', average: 0.75, count: 4 },
         { scorerId: 'helpfulness', average: 0.5, count: 2 },
       ],
-      feedback: overflow.slice(0, TRACE_QUERY_FEEDBACK_LIMIT),
-      feedbackTruncated: true,
+      scoresTruncated: false,
     });
     expect(buildTraceQuerySelection({ select: ['errorCounts'] }, input)).toEqual({
       errorCounts: { total: 2, llm: 1, tool: 1 },
     });
     expect(buildTraceQuerySelection({}, input)).toEqual({});
+    const scorers = Array.from({ length: TRACE_QUERY_SCORER_LIMIT + 1 }, (_, i) => ({
+      scorerId: `scorer-${String(TRACE_QUERY_SCORER_LIMIT - i).padStart(2, '0')}`,
+      average: 1,
+      count: 1,
+    }));
+    const capped = buildTraceQuerySelection({ include: { scores: true } }, { scores: scorers });
+    expect(capped.scores).toHaveLength(TRACE_QUERY_SCORER_LIMIT);
+    expect(capped.scores![0]!.scorerId).toBe('scorer-00');
+    expect(capped.scoresTruncated).toBe(true);
     expect(
       buildTraceQuerySelection(
         { select: ['outputPreview', 'tags', 'errorPreview', 'errorCounts', 'model', 'timeToFirstTokenMs'] },
@@ -2086,14 +2080,5 @@ describe('select and include', () => {
       timeToFirstTokenMs: null,
     });
     expect(traceQueryTraceResponseSchema.safeParse({ traces: [], page: { next: null } }).success).toBe(true);
-  });
-
-  it('orders feedback newest first with the record ID as the tie-breaker', () => {
-    const records = [
-      { id: 'b', timestamp: '2026-08-10T00:00:00.000Z' },
-      { id: 'a', timestamp: '2026-08-10T00:00:00.000Z' },
-      { id: 'c', timestamp: '2026-08-11T00:00:00.000Z' },
-    ];
-    expect(records.sort(compareTraceQueryNewestFirst).map(record => record.id)).toEqual(['c', 'a', 'b']);
   });
 });

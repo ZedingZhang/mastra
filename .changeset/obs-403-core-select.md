@@ -13,4 +13,4 @@ Added `select` and `include` to advanced trace queries, so a Traces table gets t
 }
 ```
 
-`select` accepts `outputPreview`, `tags`, `errorPreview`, `errorCounts`, `model`, `timeToFirstTokenMs`, `promptCacheReadTokens`, and `promptCacheCreationTokens`. `include.scores` adds one average per scorer, and `include.feedback` adds the newest feedback. Each row carries only the keys you asked for.
+`select` accepts `outputPreview`, `tags`, `errorPreview`, `errorCounts`, `model`, `timeToFirstTokenMs`, `promptCacheReadTokens`, and `promptCacheCreationTokens`. `include.scores` adds one average per scorer. Each row carries only the keys you asked for.

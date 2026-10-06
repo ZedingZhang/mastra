@@ -715,7 +715,7 @@ describe('QUERY_TRACES', () => {
   });
 
   it('returns 501 before calling an older store for select or include requests', async () => {
-    for (const request of [{ select: ['tags'] }, { include: { feedback: true } }]) {
+    for (const request of [{ select: ['tags'] }, { include: { scores: true } }]) {
       const { mastra, observabilityStore } = createHarness(['trace-query']);
       const error = await captureHttpException(
         QUERY_TRACES.handler(params(mastra, { timeRange: TIME_RANGE, ...request })),

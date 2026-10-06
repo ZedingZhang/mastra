@@ -369,7 +369,7 @@ Both routes require `observability:read` and use the configured observability st
 | `after` | No | Delta mode only. Opaque `deltaCursor` from a numbered page or previous poll. Omit to establish the current watermark. |
 | `limit` | No | Delta mode only. Maximum results per batch. Defaults to 10 and has a maximum of 100. |
 | `select` | No | Fields to add to every trace row, from the list in [Add fields to trace rows](#add-fields-to-trace-rows). Not accepted with `group`, and the page can't exceed 100 traces. |
-| `include` | No | Related records to add to every trace row: `{ scores: true }` for one average per scorer, `{ feedback: true }` for the newest feedback. Same limits as `select`. |
+| `include` | No | Related records to add to every trace row. `{ scores: true }` adds one average per scorer. Same limits as `select`. |
 
 ### Thread queries
 
@@ -397,7 +397,7 @@ The planner rejects a query before storage execution when it exceeds any of thes
 | Raw predicate path | 128 UTF-8 bytes |
 | `page.limit` | 1,000 |
 | `page.limit`, `pagination.perPage`, or delta `limit` with `select` or `include` | 100 |
-| Feedback records per trace with `include.feedback` | 10 |
+| Scorers per trace with `include.scores` | 50 |
 | HTTP request body | 256 KiB |
 
 Each comparison literal counts as one literal. Each member of an `in` or `notIn` set also counts as one literal, even when the set is within its per-set limit.
@@ -762,7 +762,8 @@ const result = await mastraClient.queryTraces({
   "scores": [
     { "scorerId": "factuality", "average": 0.65, "count": 2 },
     { "scorerId": "helpfulness", "average": 0.75, "count": 2 }
-  ]
+  ],
+  "scoresTruncated": false
 }
 ```
 
@@ -782,8 +783,7 @@ The span fields share one query, so selecting all of them costs the same as sele
 
 | `include` | Cost | Source and meaning |
 | - | - | - |
-| `scores: true` | One score query | `scores`: one entry per scorer, ordered by `scorerId`. `average` is the mean of the scorer's current scores on the trace and its spans, and `count` is how many there are. Each `scoreId` contributes its latest write only. |
-| `feedback: true` | One feedback query | `feedback`: up to 10 current feedback records, newest first with `feedbackId` as the tie-breaker. `feedbackTruncated` is `true` when the trace has more. |
+| `scores: true` | One score query | `scores`: one entry per scorer, ordered by `scorerId`, up to 50. `average` is the mean of the scorer's current scores on the trace and its spans, across all scorer versions, and `count` is how many there are. Each `scoreId` contributes its latest write only. `scoresTruncated` is `true` when the trace has more scorers. |
 
 The values don't depend on the `where` predicate that selected the trace.
 
