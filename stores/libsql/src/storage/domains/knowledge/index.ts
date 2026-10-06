@@ -1428,7 +1428,6 @@ export class KnowledgeLibSQL extends KnowledgeStorage {
 
   async deleteRecordBySource(input: {
     id: string;
-    version: number;
     source: string;
     version: number;
     importRunId?: string;
