@@ -893,10 +893,15 @@ interface TableSummaryRows {
  * Bounded side queries for the selected page only. Each reads the same current-record
  * shape as the trace scope, restricted to the page's trace IDs, and never touches
  * ordering or totals: the page query already fixed them.
+ *
+ * Spans and metrics start at `from`, a day before the requested window. A trace ID lookup
+ * cannot prune on its own here: a day holds only a few index granules, so a page of trace IDs
+ * touches all of them and every partition is read.
  */
 export function compileClickHouseTableSummaryQueries(
   scope: TraceQueryTenantScope | undefined,
   traceIds: string[],
+  from: string,
 ): {
   rollups: CompiledClickHouseTraceQuery;
   feedback: CompiledClickHouseTraceQuery;
@@ -904,6 +909,8 @@ export function compileClickHouseTableSummaryQueries(
 } {
   const list = (types: readonly string[]) => types.map(type => `'${type}'`).join(', ');
   const relatedLimit = coreStorage.TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT + 1;
+  // ClickHouse reads a backslash in a string literal as an escape, so the shared pattern doubles.
+  const isoPattern = coreStorage.TRACE_QUERY_TIMESTAMP_PATTERN.replace(/\\/g, '\\\\');
   const compile = (build: (parameters: ParameterBuilder, ids: string, tenant: string) => string) => {
     const parameters = new ParameterBuilder();
     const ids = parameters.add(traceIds, 'Array(String)');
@@ -914,10 +921,12 @@ export function compileClickHouseTableSummaryQueries(
   const rollups = compile((parameters, ids, tenant) => {
     const read = parameters.add(coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheReadTokens, 'String');
     const write = parameters.add(coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheCreationTokens, 'String');
+    const since = parameters.add(from, "DateTime64(3, 'UTC')");
     return `WITH current_spans AS (
     SELECT traceId, spanId, spanType, error, startedAt, attributes
     FROM ${TABLE_SPAN_EVENTS}
-    WHERE traceId IN ${ids}${tenant}
+    WHERE traceId IN ${ids}
+      AND endedAt >= ${since}${tenant}
     ORDER BY dedupeKey
     LIMIT 1 BY dedupeKey
   ),
@@ -931,7 +940,7 @@ export function compileClickHouseTableSummaryQueries(
         argMin(
           (
             if(JSONType(attributes, 'model') = 'String', JSONExtractString(attributes, 'model'), NULL),
-            ${durationMsSql('startedAt', "parseDateTime64BestEffortOrNull(JSONExtractString(attributes, 'completionStartTime'), 3)")}
+            ${durationMsSql('startedAt', `if(match(JSONExtractString(attributes, 'completionStartTime'), '${isoPattern}'), parseDateTime64BestEffortOrNull(JSONExtractString(attributes, 'completionStartTime'), 3), NULL)`)}
           ),
           (startedAt, spanId)
         ) AS earliest
@@ -949,6 +958,7 @@ export function compileClickHouseTableSummaryQueries(
       SELECT traceId, spanId, name, value
       FROM ${TABLE_METRIC_EVENTS}
       WHERE traceId IN ${ids}
+        AND timestamp >= ${since}
         AND name IN (${read}, ${write})${tenant}
       ORDER BY metricId
       LIMIT 1 BY metricId
@@ -1021,11 +1031,12 @@ async function loadTableSummaryRows(
   client: ClickHouseClient,
   scope: TraceQueryTenantScope | undefined,
   traceIds: string[],
+  from: string,
   timeoutMs: () => number,
 ): Promise<TableSummaryRows> {
   const result: TableSummaryRows = { rollups: new Map(), feedback: new Map(), scores: new Map() };
   if (traceIds.length === 0) return result;
-  const queries = compileClickHouseTableSummaryQueries(scope, traceIds);
+  const queries = compileClickHouseTableSummaryQueries(scope, traceIds, from);
   const [rollupRows, feedbackRows, scoreRows] = await Promise.all([
     runWithClickHouseTraceQueryTimeout(client, { timeoutMs: timeoutMs() }, queries.rollups),
     runWithClickHouseTraceQueryTimeout(client, { timeoutMs: timeoutMs() }, queries.feedback),
@@ -1120,6 +1131,7 @@ async function mapTraceRows(
           client,
           plan.scope,
           rows.map(row => String(row.traceId)),
+          coreStorage.traceQueryTableSummaryFrom(plan.timeRange),
           timeoutMs,
         )
       : undefined;

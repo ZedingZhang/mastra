@@ -2,6 +2,8 @@ import { coreFeatures } from '@mastra/core/features';
 import {
   buildTraceQueryTableSummary,
   compareTraceQuerySummaryRecords,
+  parseTraceQueryTimestamp,
+  traceQueryTableSummaryFrom,
   compareTraceQueryStrings,
   encodeTraceQueryCursor,
   encodeTraceQueryDeltaCursor,
@@ -1066,7 +1068,7 @@ export const TRACE_QUERY_SCORE_TIE_FIXTURE_DATA: TraceQueryFixtureData = {
 
 const tableSummaryRange = { from: '2026-08-20T00:00:00Z', to: '2026-08-21T00:00:00Z' };
 const tableSummaryStartedAt = (offsetMs: number) =>
-  new Date(Date.parse('2026-08-20T10:00:00.000Z') + offsetMs).toISOString();
+  new Date(Date.parse(tableSummaryRange.from) + offsetMs).toISOString();
 
 export const TRACE_QUERY_TABLE_SUMMARY_TIME_RANGE = tableSummaryRange;
 
@@ -1154,8 +1156,8 @@ export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
       endedAt: tableSummaryStartedAt(3400),
       error: { message: 'post-processing failed' },
     }),
-    // Imported spans can carry a clock that runs behind the root's. Summaries read every span
-    // of the trace, so this one counts even though it starts before the root.
+    // Imported spans can carry a clock that runs behind the root's, which puts this one before
+    // the requested window. The look-back keeps it, so it still counts.
     span(12, 'summary-a', 'tool-a-early', {
       parentSpanId: 'root-a',
       spanType: 'tool_call',
@@ -1175,14 +1177,15 @@ export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
       output: 'plain text answer',
     }),
     // Earliest model span: a non-streaming call with no model attribute and a first-token time
-    // no calendar can hold. Stores report null for both rather than borrowing the later span's
-    // values or failing the page.
+    // no calendar can hold. September has 30 days, and a lenient parse rolls the value forward
+    // into October, so stores must report null for both rather than borrowing the later span's
+    // values, inventing a duration, or failing the page.
     span(10, 'summary-c', 'model-c-1', {
       parentSpanId: 'root-c',
       spanType: 'model_generation',
       startedAt: tableSummaryStartedAt(20_100),
       endedAt: tableSummaryStartedAt(21_000),
-      attributes: { provider: 'anthropic', completionStartTime: '2026-02-30T10:00:00.000Z' },
+      attributes: { provider: 'anthropic', completionStartTime: '2026-09-31T10:00:00.000Z' },
     }),
     span(11, 'summary-c', 'model-c-2', {
       parentSpanId: 'root-c',
@@ -2809,7 +2812,17 @@ export function evaluateTraceQuery(data: TraceQueryFixtureData, plan: TrustedTra
   const feedback = currentFeedback(data.feedback).filter(record => matchesScope(record, plan.scope));
   const toTrace = (root: RawTraceQuerySpan): TraceQueryTrace =>
     plan.tableSummary
-      ? { ...toTraceQueryTrace(root), tableSummary: evaluateTableSummary(root, spans, scores, feedback, data.metrics) }
+      ? {
+          ...toTraceQueryTrace(root),
+          tableSummary: evaluateTableSummary(
+            root,
+            spans,
+            scores,
+            feedback,
+            data.metrics,
+            traceQueryTableSummaryFrom(plan.timeRange),
+          ),
+        }
       : toTraceQueryTrace(root);
   if (plan.paginationMode === 'delta') {
     const watermark = getTraceQueryDeltaWatermark(plan, 'reference');
@@ -3224,8 +3237,11 @@ function evaluateTableSummary(
   scores: RawTraceQueryScore[],
   feedback: RawTraceQueryFeedback[],
   metrics: RawTraceQueryMetric[] = [],
+  from = '',
 ): TraceQueryTableSummary {
-  const traceSpans = spans.filter(span => span.traceId === root.traceId);
+  // Spans and metrics are read from `from`, a day before the requested window; feedback and
+  // scores are not, because a reviewer can add them at any time afterwards.
+  const traceSpans = spans.filter(span => span.traceId === root.traceId && (span.endedAt ?? '') >= from);
   const modelSpan = traceSpans
     .filter(span => TRACE_QUERY_TABLE_SUMMARY_MODEL_SPAN_TYPES.includes(span.spanType))
     .sort(
@@ -3235,16 +3251,15 @@ function evaluateTableSummary(
     )[0];
   const model = modelSpan?.attributes?.model;
   const completionStartTime = modelSpan?.attributes?.completionStartTime;
-  const timeToFirstTokenMs =
-    modelSpan && typeof completionStartTime === 'string' && !Number.isNaN(Date.parse(completionStartTime))
-      ? Date.parse(completionStartTime) - Date.parse(modelSpan.startedAt)
-      : null;
+  const firstToken = parseTraceQueryTimestamp(completionStartTime);
+  const timeToFirstTokenMs = modelSpan && firstToken !== null ? firstToken - Date.parse(modelSpan.startedAt) : null;
   const currentSpanIds = new Set(traceSpans.map(span => span.spanId));
   const sumMetric = (name: string): number | null => {
     const rows = currentMetrics(metrics).filter(
       metric =>
         metric.name === name &&
         metric.traceId === root.traceId &&
+        metric.timestamp >= from &&
         metric.spanId !== null &&
         currentSpanIds.has(metric.spanId),
     );

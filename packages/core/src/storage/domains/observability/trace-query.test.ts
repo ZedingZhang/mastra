@@ -52,6 +52,7 @@ import {
   TraceQueryResourceLimitError,
   TraceQueryValidationError,
   type TraceQueryPredicate,
+  parseTraceQueryTimestamp,
 } from './trace-query';
 
 const baseRequest = {
@@ -1936,6 +1937,26 @@ describe('trace-query responses and storage capability', () => {
         planTraceQueryValues(parseGetTraceQueryValuesArgs({ ...baseRequest, predicateScope: 'trace', path: 'status' })),
       ),
     ).rejects.toMatchObject({ id: 'OBSERVABILITY_STORAGE_TRACE_QUERY_DISCOVERY_NOT_IMPLEMENTED' });
+  });
+});
+
+describe('span timestamps', () => {
+  it('reads only real ISO instants, so an impossible date is absent rather than rolled forward', () => {
+    expect(parseTraceQueryTimestamp('2026-09-30T00:00:05Z')).toBe(Date.parse('2026-09-30T00:00:05Z'));
+    expect(parseTraceQueryTimestamp('2026-09-30T00:00:05+05:30')).toBe(Date.parse('2026-09-30T00:00:05+05:30'));
+    expect(parseTraceQueryTimestamp('2024-02-29T00:00:00Z')).toBe(Date.parse('2024-02-29T00:00:00Z'));
+    for (const value of [
+      '2026-09-31T00:00:05Z',
+      '2026-02-30T10:00:00.000Z',
+      '2026-02-29T00:00:00Z',
+      '2026-09-30T25:00:05Z',
+      'Sep 30 2026 00:00:05',
+      '2026-09-30 00:00:05',
+      '',
+      null,
+    ]) {
+      expect(parseTraceQueryTimestamp(value), String(value)).toBeNull();
+    }
   });
 });
 

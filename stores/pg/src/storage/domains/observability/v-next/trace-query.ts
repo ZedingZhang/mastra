@@ -963,11 +963,15 @@ interface TableSummaryRows {
  * Bounded side queries for the selected page only. Each reads the same current-record
  * shape as the trace scope, restricted to the page's trace IDs, and never touches
  * ordering or totals: the page query already fixed them.
+ *
+ * Spans and metrics start at `from`, a day before the requested window, so a page of trace IDs
+ * does not open every partition.
  */
 export function compilePostgresTableSummaryQueries(
   schema: string,
   scope: TraceQueryTenantScope | undefined,
   traceIds: string[],
+  from: string,
 ): { rollups: CompiledPostgresTraceQuery; feedback: CompiledPostgresTraceQuery; scores: CompiledPostgresTraceQuery } {
   const spanTable = qualifiedTable(schema, TABLE_SPAN_EVENTS);
   const metricTable = qualifiedTable(schema, TABLE_METRIC_EVENTS);
@@ -991,16 +995,19 @@ export function compilePostgresTableSummaryQueries(
     scopeConditions.map(condition => `\n      AND ${alias}.${condition}`).join('');
   const readMetric = `$${values.length + 1}`;
   const writeMetric = `$${values.length + 2}`;
+  const since = `$${values.length + 3}::timestamptz`;
   const rollupValues = [
     ...values,
     coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheReadTokens,
     coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheCreationTokens,
+    from,
   ];
   const rollups: CompiledPostgresTraceQuery = {
     text: `WITH current_spans AS (
     SELECT s."traceId", s."spanId", s."spanType", s."error", s."startedAt", s."attributes"
     FROM ${spanTable} s
     WHERE s."traceId" = ANY($1::text[])
+      AND s."endedAt" >= ${since}
       AND ${latestSpanPredicate(spanTable)}${scopeSql('s')}
   ),
   model_spans AS (
@@ -1027,6 +1034,7 @@ export function compilePostgresTableSummaryQueries(
       SELECT DISTINCT ON (m."metricId") m."traceId", m."spanId", m."name", m."value"
       FROM ${metricTable} m
       WHERE m."traceId" = ANY($1::text[])
+        AND m."timestamp" >= ${since}
         AND m."name" IN (${readMetric}, ${writeMetric})${scopeSql('m')}
       ORDER BY m."metricId", m."timestamp"
     ) m
@@ -1084,10 +1092,10 @@ ORDER BY "traceId" ASC, "relatedRank" ASC`,
 }
 
 function timeToFirstToken(startedAt: unknown, completionStartTime: unknown): number | null {
-  if (startedAt == null || completionStartTime == null) return null;
-  const start = startedAt instanceof Date ? startedAt.getTime() : new Date(String(startedAt)).getTime();
-  const firstToken = new Date(String(completionStartTime)).getTime();
-  if (Number.isNaN(start) || Number.isNaN(firstToken)) return null;
+  if (startedAt == null) return null;
+  const start = startedAt instanceof Date ? startedAt.getTime() : Date.parse(String(startedAt));
+  const firstToken = coreStorage.parseTraceQueryTimestamp(completionStartTime);
+  if (Number.isNaN(start) || firstToken === null) return null;
   return Math.floor(firstToken - start);
 }
 
@@ -1100,11 +1108,12 @@ async function loadTableSummaryRows(
   schema: string,
   scope: TraceQueryTenantScope | undefined,
   traceIds: string[],
+  from: string,
   deadline?: number,
 ): Promise<TableSummaryRows> {
   const result: TableSummaryRows = { rollups: new Map(), feedback: new Map(), scores: new Map() };
   if (traceIds.length === 0) return result;
-  const queries = compilePostgresTableSummaryQueries(schema, scope, traceIds);
+  const queries = compilePostgresTableSummaryQueries(schema, scope, traceIds, from);
   // `statement_timeout` is per statement, so re-derive the remaining budget before each one.
   const run = async (query: CompiledPostgresTraceQuery) => {
     if (deadline !== undefined) await setRemainingTimeout(transaction, deadline);
@@ -1207,6 +1216,7 @@ async function mapTraceRows(
       schema,
       plan.scope,
       rows.map(row => String(row.traceId)),
+      coreStorage.traceQueryTableSummaryFrom(plan.timeRange),
       deadline,
     );
   }

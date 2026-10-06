@@ -33,6 +33,44 @@ export const TRACE_QUERY_TABLE_SUMMARY_MAX_PAGE_SIZE = 100;
  * These mirror `TokenMetrics` in `@mastra/observability`, which depends on core and
  * therefore can't be imported here.
  */
+/**
+ * ISO 8601 with a date, a time, and a zone. Stores apply the same pattern in SQL, because the
+ * engines disagree on everything else: `Date.parse` reads `Sep 30 2026 00:00:05` in the local
+ * zone and ClickHouse reads it as UTC, while DuckDB rejects it.
+ */
+export const TRACE_QUERY_TIMESTAMP_PATTERN = String.raw`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$`;
+
+/**
+ * Reads a timestamp recorded on a span, such as a model call's first-token time. Returns
+ * milliseconds since the epoch, or null when the value is not a real instant: JavaScript rolls
+ * an impossible calendar date forward, so `2026-09-31` would otherwise read as 1 October, while
+ * every store's SQL reports it as absent.
+ */
+export function parseTraceQueryTimestamp(value: unknown): number | null {
+  if (typeof value !== 'string') return null;
+  const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/.exec(value);
+  if (!parts) return null;
+  const [, year, month, day, hour, minute, second] = parts.map(Number) as unknown as number[];
+  const lastDayOfMonth = new Date(Date.UTC(year!, month!, 0)).getUTCDate();
+  if (month! < 1 || month! > 12 || day! < 1 || day! > lastDayOfMonth) return null;
+  if (hour! > 23 || minute! > 59 || second! > 59) return null;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * How far before the requested window a trace's spans and metrics are still read. Records
+ * cannot precede their own trace, but a writer's clock can run behind, so the side queries
+ * start a day early. A trace with an earlier run outside the window keeps that run's records
+ * out of its summary, the same bound the trace aggregates apply.
+ */
+export const TRACE_QUERY_TABLE_SUMMARY_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+
+/** The instant the table summary's span and metric lookups start at. */
+export function traceQueryTableSummaryFrom(timeRange: { from: string }): string {
+  return new Date(Date.parse(timeRange.from) - TRACE_QUERY_TABLE_SUMMARY_LOOKBACK_MS).toISOString();
+}
+
 export const TRACE_QUERY_TABLE_SUMMARY_METRICS = {
   promptCacheReadTokens: 'mastra_model_input_cache_read_tokens',
   promptCacheCreationTokens: 'mastra_model_input_cache_write_tokens',

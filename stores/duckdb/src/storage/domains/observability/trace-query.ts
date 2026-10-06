@@ -874,10 +874,14 @@ interface TableSummaryRows {
  * Bounded side queries for the selected page only. Each reads the same current-record
  * shape as the trace scope, restricted to the page's trace IDs, and never touches
  * ordering or totals: the page query already fixed them.
+ *
+ * Spans and metrics start at `from`, a day before the requested window, so a page of trace IDs
+ * does not read every stored event.
  */
 export function compileDuckDBTableSummaryQueries(
   scope: TraceQueryTenantScope | undefined,
   traceIds: string[],
+  from: string,
 ): { rollups: CompiledDuckDBTraceQuery; feedback: CompiledDuckDBTraceQuery; scores: CompiledDuckDBTraceQuery } {
   const ids = traceIds.map(() => '?').join(', ');
   const tenantConditions = (alias: string): string[] =>
@@ -889,15 +893,19 @@ export function compileDuckDBTableSummaryQueries(
       ? [scope.organizationId]
       : [scope.organizationId, scope.resourceId]
     : [];
-  const where = (alias: string): { sql: string; values: unknown[] } => ({
-    sql: [`${alias}.traceId IN (${ids})`, ...tenantConditions(alias)].join('\n        AND '),
-    values: [...traceIds, ...tenantValues],
+  const where = (alias: string, since = false): { sql: string; values: unknown[] } => ({
+    sql: [
+      `${alias}.traceId IN (${ids})`,
+      ...tenantConditions(alias),
+      ...(since ? [`${alias}.timestamp >= CAST(? AS TIMESTAMP)`] : []),
+    ].join('\n        AND '),
+    values: [...traceIds, ...tenantValues, ...(since ? [from] : [])],
   });
   const list = (types: readonly string[]) => types.map(type => `'${type}'`).join(', ');
   const relatedLimit = coreStorage.TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT + 1;
 
-  const spanWhere = where('e');
-  const metricWhere = where('m');
+  const spanWhere = where('e', true);
+  const metricWhere = where('m', true);
   const rollups: CompiledDuckDBTraceQuery = {
     sql: `WITH current_span_rows AS (
       SELECT
@@ -922,7 +930,7 @@ export function compileDuckDBTableSummaryQueries(
       SELECT
         traceId,
         CASE WHEN json_type(attributes, '$.model') = 'VARCHAR' THEN json_extract_string(attributes, '$.model') END AS model,
-        ${durationMsSql('startedAt', `TRY_CAST(json_extract_string(attributes, '$.completionStartTime') AS TIMESTAMP)`)} AS timeToFirstTokenMs,
+        ${durationMsSql('startedAt', `CASE WHEN regexp_matches(json_extract_string(attributes, '$.completionStartTime'), ?) THEN TRY_CAST(json_extract_string(attributes, '$.completionStartTime') AS TIMESTAMP) END`)} AS timeToFirstTokenMs,
         row_number() OVER (PARTITION BY traceId ORDER BY startedAt ASC, spanId ASC) AS modelRank
       FROM current_spans
       WHERE spanType IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_MODEL_SPAN_TYPES)})
@@ -959,6 +967,8 @@ LEFT JOIN metric_sums mt ON mt.traceId = c.traceId
 GROUP BY c.traceId`,
     values: [
       ...spanWhere.values,
+      // The pattern is bound, not inlined: DuckDB counts a `?` inside a string literal as a parameter.
+      coreStorage.TRACE_QUERY_TIMESTAMP_PATTERN,
       coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheReadTokens,
       coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheCreationTokens,
       ...metricWhere.values,
@@ -1008,10 +1018,11 @@ async function loadTableSummaryRows(
   db: DuckDBConnection,
   scope: TraceQueryTenantScope | undefined,
   traceIds: string[],
+  from: string,
 ): Promise<TableSummaryRows> {
   const result: TableSummaryRows = { rollups: new Map(), feedback: new Map(), scores: new Map() };
   if (traceIds.length === 0) return result;
-  const queries = compileDuckDBTableSummaryQueries(scope, traceIds);
+  const queries = compileDuckDBTableSummaryQueries(scope, traceIds, from);
   const [rollupRows, feedbackRows, scoreRows] = await Promise.all([
     db.query<Record<string, unknown>>(queries.rollups.sql, queries.rollups.values),
     db.query<Record<string, unknown>>(queries.feedback.sql, queries.feedback.values),
@@ -1101,6 +1112,7 @@ async function mapTraceRows(db: DuckDBConnection, plan: TrustedTraceQueryPlan, r
           db,
           plan.scope,
           rows.map(row => String(row.traceId)),
+          coreStorage.traceQueryTableSummaryFrom(plan.timeRange),
         )
       : undefined;
   return rows.map(row => traceRowToResult(row, summaries));
