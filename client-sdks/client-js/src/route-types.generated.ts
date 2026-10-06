@@ -3587,6 +3587,7 @@ type Shared_Type_66 = {
   tags: string[];
   model: string | null;
   timeToFirstTokenMs: number | null;
+  errorPreview: string | null;
   errorCounts: {
     total: number;
     llm: number;
