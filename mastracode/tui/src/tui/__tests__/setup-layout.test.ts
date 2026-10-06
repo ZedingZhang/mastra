@@ -68,6 +68,10 @@ vi.mock('../status-line.js', () => ({
   updateStatusLine: updateStatusLineMock,
 }));
 
+vi.mock('../model-packs/apply.js', () => ({
+  switchModeWithPack: vi.fn(),
+}));
+
 import { buildLayout, subscribeToAgentController } from '../setup.js';
 import { updateStatusLine } from '../status-line.js';
 

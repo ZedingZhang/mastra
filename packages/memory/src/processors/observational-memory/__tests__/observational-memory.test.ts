@@ -1743,6 +1743,31 @@ describe('Observer Agent Helpers', () => {
       expect(formatted).not.toContain(base64);
     });
 
+    it('should fall back to the raw tool result when stored modelOutput is null', () => {
+      const msg = createTestMessage('ignored', 'assistant');
+      msg.content = {
+        format: 2,
+        parts: [
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              state: 'result',
+              toolCallId: 'tool-bg',
+              toolName: 'bg',
+              args: {},
+              result: { ok: true, answer: 'background task finished' },
+            },
+            providerMetadata: { mastra: { modelOutput: null, backgroundTask: { taskId: 't1', status: 'completed' } } },
+          },
+        ],
+      } as any;
+
+      const formatted = formatMessagesForObserver([msg]);
+      expect(formatted).toContain('Tool Result bg');
+      expect(formatted).toContain('background task finished');
+      expect(formatted).not.toContain('Tool Result bg: null');
+    });
+
     it('should hoist file-data tool-result blocks under the file counter', () => {
       const base64 = 'C'.repeat(2000);
       const msg = createTestMessage('ignored', 'assistant');
@@ -2538,6 +2563,25 @@ describe('Observer Agent Helpers', () => {
       expect(content[2]).toMatchObject({ type: 'image', image: 'https://example.com/reference-board.png' });
       expect(content[3]).toMatchObject({ type: 'image', image: 'https://example.com/annotated-photo.jpg' });
       expect(content).not.toContainEqual(expect.objectContaining({ image: 'https://example.com/floorplan.pdf' }));
+    });
+
+    it('should not attach attachments the agent recorded as unavailable', () => {
+      const msg = createTestMessage('ignored', 'user');
+      msg.content = {
+        format: 2,
+        parts: [
+          { type: 'text', text: 'Look at these.' },
+          { type: 'file', data: 'https://example.com/deleted.png', mimeType: 'image/png', filename: 'deleted.png' },
+          { type: 'file', data: 'https://example.com/kept.png', mimeType: 'image/png', filename: 'kept.png' },
+        ],
+        metadata: { mastra: { unavailableAttachments: ['https://example.com/deleted.png'] } },
+      };
+
+      const content = buildObserverHistoryMessage([msg]).content as any[];
+      expect(content[1].text).toContain('[Image #1: deleted.png]');
+      expect(content[1].text).toContain('[Image #2: kept.png]');
+      const attachments = content.filter(part => part.type !== 'text');
+      expect(attachments).toEqual([expect.objectContaining({ type: 'image', image: 'https://example.com/kept.png' })]);
     });
 
     it('should hoist image-data tool-result blocks into observer input attachments', () => {
