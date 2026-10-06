@@ -74,11 +74,18 @@ export interface RawTraceQuerySpan {
 
 export interface RawTraceQueryMetric {
   metricId: string;
+  timestamp: string;
   traceId: string | null;
   spanId: string | null;
   name: string;
   value: number;
-  timestamp: string;
+  estimatedCost: number | null;
+  costUnit: string | null;
+  costMetadata: Record<string, unknown> | null;
+  provider: string | null;
+  model: string | null;
+  organizationId: string | null;
+  resourceId: string | null;
 }
 
 export interface RawTraceQueryScore {
@@ -1063,6 +1070,29 @@ const tableSummaryStartedAt = (offsetMs: number) =>
 
 export const TRACE_QUERY_TABLE_SUMMARY_TIME_RANGE = tableSummaryRange;
 
+const summaryMetric = (
+  metricId: string,
+  traceId: string,
+  spanId: string,
+  name: string,
+  value: number,
+  offsetMs: number,
+): RawTraceQueryMetric => ({
+  metricId,
+  timestamp: tableSummaryStartedAt(offsetMs),
+  traceId,
+  spanId,
+  name,
+  value,
+  estimatedCost: null,
+  costUnit: null,
+  costMetadata: null,
+  provider: null,
+  model: null,
+  organizationId: null,
+  resourceId: null,
+});
+
 /**
  * Traces-table projection fixture. `summary-a` exercises every field: a replaced model
  * span, LLM and tool errors, tags, bounded feedback, more scores than the per-trace
@@ -1195,54 +1225,19 @@ export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
     }),
   ],
   metrics: [
-    {
-      metricId: 'metric-a-read-1',
-      traceId: 'summary-a',
-      spanId: 'model-a-1',
-      name: 'mastra_model_input_cache_read_tokens',
-      value: 1000,
-      timestamp: tableSummaryStartedAt(1500),
-    },
-    {
-      metricId: 'metric-a-read-2',
-      traceId: 'summary-a',
-      spanId: 'model-a-2',
-      name: 'mastra_model_input_cache_read_tokens',
-      value: 200,
-      timestamp: tableSummaryStartedAt(2500),
-    },
-    {
-      metricId: 'metric-a-write-1',
-      traceId: 'summary-a',
-      spanId: 'model-a-1',
-      name: 'mastra_model_input_cache_write_tokens',
-      value: 300,
-      timestamp: tableSummaryStartedAt(1500),
-    },
-    {
-      metricId: 'metric-a-stale-span',
-      traceId: 'summary-a',
-      spanId: 'model-a-stale',
-      name: 'mastra_model_input_cache_read_tokens',
-      value: 9999,
-      timestamp: tableSummaryStartedAt(1500),
-    },
-    {
-      metricId: 'metric-a-other-name',
-      traceId: 'summary-a',
-      spanId: 'model-a-1',
-      name: 'mastra_model_total_input_tokens',
-      value: 5000,
-      timestamp: tableSummaryStartedAt(1500),
-    },
-    {
-      metricId: 'metric-c-read-1',
-      traceId: 'summary-c',
-      spanId: 'model-c-1',
-      name: 'mastra_model_input_cache_read_tokens',
-      value: 0,
-      timestamp: tableSummaryStartedAt(21_000),
-    },
+    summaryMetric('metric-a-read-1', 'summary-a', 'model-a-1', 'mastra_model_input_cache_read_tokens', 1000, 1500),
+    summaryMetric('metric-a-read-2', 'summary-a', 'model-a-2', 'mastra_model_input_cache_read_tokens', 200, 2500),
+    summaryMetric('metric-a-write-1', 'summary-a', 'model-a-1', 'mastra_model_input_cache_write_tokens', 300, 1500),
+    summaryMetric(
+      'metric-a-stale-span',
+      'summary-a',
+      'model-a-stale',
+      'mastra_model_input_cache_read_tokens',
+      9999,
+      1500,
+    ),
+    summaryMetric('metric-a-other-name', 'summary-a', 'model-a-1', 'mastra_model_total_input_tokens', 5000, 1500),
+    summaryMetric('metric-c-read-1', 'summary-c', 'model-c-1', 'mastra_model_input_cache_read_tokens', 0, 21_000),
   ],
 };
 
@@ -2785,6 +2780,9 @@ export function evaluateTraceQuery(data: TraceQueryFixtureData, plan: TrustedTra
   }
 
   const head = data.spans.reduce((max, row) => (row.parentSpanId === null ? Math.max(max, row.cursorId) : max), 0);
+  const spans = currentSpans(data.spans).filter(span => matchesScope(span, plan.scope));
+  const scores = currentScores(data.scores).filter(score => matchesScope(score, plan.scope));
+  const feedback = currentFeedback(data.feedback).filter(record => matchesScope(record, plan.scope));
   const toTrace = (root: RawTraceQuerySpan): TraceQueryTrace =>
     plan.tableSummary
       ? { ...toTraceQueryTrace(root), tableSummary: evaluateTableSummary(root, spans, scores, feedback, data.metrics) }

@@ -25,6 +25,7 @@ import {
   matchesScope,
   selectTraceQueryRoots,
   traceQueryDimensionValue,
+  type RawTraceQueryMetric,
   type RawTraceQuerySpan,
   type TraceQueryFixtureData,
 } from './trace-query';
@@ -44,21 +45,7 @@ import {
  */
 
 /** Storage-shaped subset of a `metric_events` row (`CreateMetricRecord`) that usage aggregation reads. */
-export interface RawTraceAggregateMetric {
-  metricId: string;
-  timestamp: string;
-  traceId: string | null;
-  spanId: string | null;
-  name: string;
-  value: number;
-  estimatedCost: number | null;
-  costUnit: string | null;
-  costMetadata: Record<string, unknown> | null;
-  provider: string | null;
-  model: string | null;
-  organizationId: string | null;
-  resourceId: string | null;
-}
+export type RawTraceAggregateMetric = RawTraceQueryMetric;
 
 /** Trace-query fixture data plus the token metric rows correlated to its traces by `traceId`. */
 export type TraceAggregateFixtureData = TraceQueryFixtureData & { metrics?: RawTraceAggregateMetric[] };

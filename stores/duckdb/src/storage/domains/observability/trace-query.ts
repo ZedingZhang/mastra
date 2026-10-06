@@ -131,7 +131,7 @@ const TRACE_SELECT = `
 /** The table summary needs the root output and tags; other queries leave the blobs off the read path. */
 function traceSelect(plan: TrustedTraceQueryPlan): string {
   return plan.result === 'traces' && plan.tableSummary
-    ? `${TRACE_SELECT},\n  r.output AS output,\n  r.tags AS tags`
+    ? `${TRACE_SELECT},\n  ${payloadColumnSql('r.output')} AS output,\n  r.tags AS tags`
     : TRACE_SELECT;
 }
 

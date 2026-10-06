@@ -236,20 +236,6 @@ export async function writeTraceQueryFixture(
       },
     });
   }
-
-  if (data.metrics?.length) {
-    await storage.batchCreateMetrics({
-      metrics: data.metrics.map(metric => ({
-        metricId: metric.metricId,
-        traceId: metric.traceId,
-        spanId: metric.spanId,
-        name: metric.name,
-        value: metric.value,
-        timestamp: new Date(metric.timestamp),
-        labels: {},
-      })),
-    });
-  }
 }
 
 /**
@@ -703,7 +689,7 @@ export function createObservabilityVNextTests(options: CreateObservabilityVNextT
       });
 
       it('projects bounded table summaries without changing trace order, cursors, or totals', async () => {
-        await writeTraceQueryFixture(
+        await writeTraceAggregateFixture(
           storage,
           TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA,
           capabilities.traceQuerySpanWriteModel,
@@ -771,7 +757,7 @@ export function createObservabilityVNextTests(options: CreateObservabilityVNextT
             planTraceQuery(parseTraceQueryRequest({ timeRange, mode: 'delta', include: { tableSummary: true } })),
           );
           if (!('delta' in bootstrap)) throw new Error('Expected delta');
-          await writeTraceQueryFixture(
+          await writeTraceAggregateFixture(
             storage,
             TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA,
             capabilities.traceQuerySpanWriteModel,

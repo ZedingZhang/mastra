@@ -79,6 +79,17 @@ export {
   getTraceQueryDeltaWatermark,
   planTraceQuerySelectionPredicate,
   normalizeTraceQueryPath,
+  TRACE_QUERY_TABLE_SUMMARY_RELATED_LIMIT,
+  TRACE_QUERY_TABLE_SUMMARY_MAX_PAGE_SIZE,
+  TRACE_QUERY_TABLE_SUMMARY_METRICS,
+  TRACE_QUERY_TABLE_SUMMARY_MODEL_SPAN_TYPES,
+  TRACE_QUERY_TABLE_SUMMARY_LLM_SPAN_TYPES,
+  TRACE_QUERY_TABLE_SUMMARY_TOOL_SPAN_TYPES,
+  traceQueryFeedbackSummarySchema,
+  traceQueryScoreSummarySchema,
+  traceQueryTableSummarySchema,
+  buildTraceQueryTableSummary,
+  compareTraceQuerySummaryRecords,
 } from './trace-query';
 export type {
   TraceQueryLiteral,
@@ -145,6 +156,10 @@ export type {
   TraceQueryIssueCode,
   TraceQueryIssue,
   TraceQueryPlanOptions,
+  TraceQueryTableSummary,
+  TraceQueryFeedbackSummary,
+  TraceQueryScoreSummary,
+  TraceQueryTableSummaryInput,
 } from './trace-query';
 export * from './tracing';
 export * from './types';
