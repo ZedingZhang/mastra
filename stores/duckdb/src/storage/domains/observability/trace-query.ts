@@ -932,10 +932,16 @@ export function compileDuckDBTableSummaryQueries(
         m.traceId,
         sum(m.value) FILTER (WHERE m.name = ?) AS promptCacheReadTokens,
         sum(m.value) FILTER (WHERE m.name = ?) AS promptCacheCreationTokens
-      FROM metric_events m
+      FROM (
+        -- Keep one row per metricId: a retried export writes the same metric again, and
+        -- tables created before the metricId key store both copies.
+        SELECT DISTINCT ON (m.metricId) m.traceId, m.spanId, m.name, m.value
+        FROM metric_events m
+        WHERE ${metricWhere.sql}
+          AND m.name IN (?, ?)
+        ORDER BY m.metricId, m.timestamp
+      ) m
       INNER JOIN current_spans c ON c.traceId = m.traceId AND c.spanId = m.spanId
-      WHERE ${metricWhere.sql}
-        AND m.name IN (?, ?)
       GROUP BY m.traceId
     )
 SELECT

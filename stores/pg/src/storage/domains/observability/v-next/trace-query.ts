@@ -959,8 +959,6 @@ interface TableSummaryRows {
   scores: Map<string, coreStorage.TraceQueryScoreSummary[]>;
 }
 
-const ISO_TIMESTAMP_PATTERN = String.raw`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$`;
-
 /**
  * Bounded side queries for the selected page only. Each reads the same current-record
  * shape as the trace scope, restricted to the page's trace IDs, and never touches
@@ -998,11 +996,6 @@ export function compilePostgresTableSummaryQueries(
     coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheReadTokens,
     coreStorage.TRACE_QUERY_TABLE_SUMMARY_METRICS.promptCacheCreationTokens,
   ];
-  const completionStartTime = `CASE
-          WHEN jsonb_typeof("attributes" -> 'completionStartTime') = 'string'
-            AND ("attributes" ->> 'completionStartTime') ~ '${ISO_TIMESTAMP_PATTERN}'
-          THEN ("attributes" ->> 'completionStartTime')::timestamptz
-        END`;
   const rollups: CompiledPostgresTraceQuery = {
     text: `WITH current_spans AS (
     SELECT s."traceId", s."spanId", s."spanType", s."error", s."startedAt", s."attributes"
@@ -1014,7 +1007,11 @@ export function compilePostgresTableSummaryQueries(
     SELECT DISTINCT ON ("traceId")
       "traceId",
       CASE WHEN jsonb_typeof("attributes" -> 'model') = 'string' THEN "attributes" ->> 'model' END AS "model",
-      floor(${durationMsSql('"startedAt"', completionStartTime)})::bigint AS "timeToFirstTokenMs"
+      "startedAt" AS "modelStartedAt",
+      CASE
+        WHEN jsonb_typeof("attributes" -> 'completionStartTime') = 'string'
+        THEN "attributes" ->> 'completionStartTime'
+      END AS "completionStartTime"
     FROM current_spans
     WHERE "spanType" IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_MODEL_SPAN_TYPES)})
     ORDER BY "traceId", "startedAt" ASC, "spanId" ASC
@@ -1024,10 +1021,16 @@ export function compilePostgresTableSummaryQueries(
       m."traceId",
       sum(m."value") FILTER (WHERE m."name" = ${readMetric}) AS "promptCacheReadTokens",
       sum(m."value") FILTER (WHERE m."name" = ${writeMetric}) AS "promptCacheCreationTokens"
-    FROM ${metricTable} m
+    FROM (
+      -- A retried export writes the same metricId again under a new timestamp, and the
+      -- primary key is ("metricId", "timestamp"), so both rows are stored. Keep one.
+      SELECT DISTINCT ON (m."metricId") m."traceId", m."spanId", m."name", m."value"
+      FROM ${metricTable} m
+      WHERE m."traceId" = ANY($1::text[])
+        AND m."name" IN (${readMetric}, ${writeMetric})${scopeSql('m')}
+      ORDER BY m."metricId", m."timestamp"
+    ) m
     INNER JOIN current_spans c ON c."traceId" = m."traceId" AND c."spanId" = m."spanId"
-    WHERE m."traceId" = ANY($1::text[])
-      AND m."name" IN (${readMetric}, ${writeMetric})${scopeSql('m')}
     GROUP BY m."traceId"
   )
 SELECT
@@ -1036,7 +1039,8 @@ SELECT
   count(*) FILTER (WHERE c."error" IS NOT NULL AND c."spanType" IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_LLM_SPAN_TYPES)})) AS "errorLlm",
   count(*) FILTER (WHERE c."error" IS NOT NULL AND c."spanType" IN (${list(coreStorage.TRACE_QUERY_TABLE_SUMMARY_TOOL_SPAN_TYPES)})) AS "errorTool",
   max(ms."model") AS "model",
-  max(ms."timeToFirstTokenMs") AS "timeToFirstTokenMs",
+  max(ms."modelStartedAt") AS "modelStartedAt",
+  max(ms."completionStartTime") AS "completionStartTime",
   max(mt."promptCacheReadTokens") AS "promptCacheReadTokens",
   max(mt."promptCacheCreationTokens") AS "promptCacheCreationTokens"
 FROM current_spans c
@@ -1079,6 +1083,14 @@ ORDER BY "traceId" ASC, "relatedRank" ASC`,
   return { rollups, feedback, scores };
 }
 
+function timeToFirstToken(startedAt: unknown, completionStartTime: unknown): number | null {
+  if (startedAt == null || completionStartTime == null) return null;
+  const start = startedAt instanceof Date ? startedAt.getTime() : new Date(String(startedAt)).getTime();
+  const firstToken = new Date(String(completionStartTime)).getTime();
+  if (Number.isNaN(start) || Number.isNaN(firstToken)) return null;
+  return Math.floor(firstToken - start);
+}
+
 function nullableNumber(value: unknown): number | null {
   return value == null ? null : Number(value);
 }
@@ -1107,7 +1119,9 @@ async function loadTableSummaryRows(
       errorLlm: Number(row.errorLlm ?? 0),
       errorTool: Number(row.errorTool ?? 0),
       model: row.model == null ? null : String(row.model),
-      timeToFirstTokenMs: nullableNumber(row.timeToFirstTokenMs),
+      // PostgreSQL has no safe cast, and casting an unparseable timestamp fails the whole
+      // page, so the difference is taken here instead. An invalid value reads as absent.
+      timeToFirstTokenMs: timeToFirstToken(row.modelStartedAt, row.completionStartTime),
       promptCacheReadTokens: nullableNumber(row.promptCacheReadTokens),
       promptCacheCreationTokens: nullableNumber(row.promptCacheCreationTokens),
     });

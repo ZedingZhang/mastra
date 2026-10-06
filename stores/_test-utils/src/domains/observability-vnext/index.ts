@@ -739,7 +739,7 @@ export function createObservabilityVNextTests(options: CreateObservabilityVNextT
         expect(secondPage.traces[0]!.tableSummary).toMatchObject({
           model: 'gpt-5',
           timeToFirstTokenMs: 420,
-          errorCounts: { total: 3, llm: 1, tool: 1 },
+          errorCounts: { total: 4, llm: 1, tool: 2 },
           promptCacheReadTokens: 1200,
           promptCacheCreationTokens: 300,
           scoresTruncated: true,

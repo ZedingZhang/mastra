@@ -170,11 +170,13 @@ export type QueryTracesDeltaInput = Omit<QueryTracesBaseInput, 'orderBy'> & {
   orderBy?: never;
 };
 
-export type QueryTracesGroupedInput = QueryTracesBaseInput & {
+export type QueryTracesGroupedInput = Omit<QueryTracesBaseInput, 'include'> & {
   /**
    * @deprecated Use `queryTraceThreads()` instead. Grouped trace queries remain supported until the next major release.
    */
   group: NonNullable<TraceQueryRequest['group']>;
+  /** A group response has no trace rows to carry the table summary, so the server rejects it here. */
+  include?: { tableSummary?: false };
   page?: TraceQueryRequest['page'];
   pagination?: never;
   mode?: never;

@@ -1097,8 +1097,10 @@ const summaryMetric = (
  * Traces-table projection fixture. `summary-a` exercises every field: a replaced model
  * span, LLM and tool errors, tags, bounded feedback, more scores than the per-trace
  * limit, a rewritten score, and cache-token metrics including rows the projection must
- * ignore. `summary-b` is a failed root with no related records. `summary-c` has an earliest
- * model span without model or first-token data, a later complete one, and rewritten feedback.
+ * ignore, a retried metric row, and a span whose clock runs behind the root's. `summary-b` is a
+ * failed root with no related records. `summary-c` has an earliest model span without a model and
+ * with an unparseable first-token time, a later complete one, rewritten feedback, and a feedback
+ * record rewritten onto it from `summary-a`.
  */
 export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
   spans: [
@@ -1152,6 +1154,15 @@ export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
       endedAt: tableSummaryStartedAt(3400),
       error: { message: 'post-processing failed' },
     }),
+    // Imported spans can carry a clock that runs behind the root's. Summaries read every span
+    // of the trace, so this one counts even though it starts before the root.
+    span(12, 'summary-a', 'tool-a-early', {
+      parentSpanId: 'root-a',
+      spanType: 'tool_call',
+      startedAt: tableSummaryStartedAt(-2000),
+      endedAt: tableSummaryStartedAt(-1500),
+      error: { message: 'cache warm-up failed' },
+    }),
     span(8, 'summary-b', 'root-b', {
       startedAt: tableSummaryStartedAt(10_000),
       endedAt: tableSummaryStartedAt(11_000),
@@ -1163,14 +1174,15 @@ export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
       tags: ['staging'],
       output: 'plain text answer',
     }),
-    // Earliest model span: a non-streaming call with no model attribute and no first-token
-    // time. Stores must report null for both rather than borrowing the later span's values.
+    // Earliest model span: a non-streaming call with no model attribute and a first-token time
+    // no calendar can hold. Stores report null for both rather than borrowing the later span's
+    // values or failing the page.
     span(10, 'summary-c', 'model-c-1', {
       parentSpanId: 'root-c',
       spanType: 'model_generation',
       startedAt: tableSummaryStartedAt(20_100),
       endedAt: tableSummaryStartedAt(21_000),
-      attributes: { provider: 'anthropic' },
+      attributes: { provider: 'anthropic', completionStartTime: '2026-02-30T10:00:00.000Z' },
     }),
     span(11, 'summary-c', 'model-c-2', {
       parentSpanId: 'root-c',
@@ -1223,9 +1235,21 @@ export const TRACE_QUERY_TABLE_SUMMARY_FIXTURE_DATA: TraceQueryFixtureData = {
       timestamp: tableSummaryStartedAt(26_000),
       comment: 'revised',
     }),
+    // Rewritten onto another trace: only the current version belongs in a summary, so this
+    // record counts for `summary-c` and must not reappear under `summary-a`.
+    feedbackRecord(304, 'feedback-moved', 'summary-a', 'thumbs_up', 'patient', 1, {
+      timestamp: tableSummaryStartedAt(7500),
+      comment: 'filed against the wrong trace',
+    }),
+    feedbackRecord(305, 'feedback-moved', 'summary-c', 'thumbs_up', 'patient', 1, {
+      timestamp: tableSummaryStartedAt(27_000),
+      comment: 'filed against the wrong trace',
+    }),
   ],
   metrics: [
     summaryMetric('metric-a-read-1', 'summary-a', 'model-a-1', 'mastra_model_input_cache_read_tokens', 1000, 1500),
+    // Exporter retry: the same metricId arrives again later and must be counted once.
+    summaryMetric('metric-a-read-1', 'summary-a', 'model-a-1', 'mastra_model_input_cache_read_tokens', 1000, 1600),
     summaryMetric('metric-a-read-2', 'summary-a', 'model-a-2', 'mastra_model_input_cache_read_tokens', 200, 2500),
     summaryMetric('metric-a-write-1', 'summary-a', 'model-a-1', 'mastra_model_input_cache_write_tokens', 300, 1500),
     summaryMetric(

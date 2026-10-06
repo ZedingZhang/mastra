@@ -980,10 +980,18 @@ FROM (
   FROM (
     SELECT *
     FROM ${TABLE_FEEDBACK_EVENTS} FINAL
-    WHERE traceId IN ${ids}${tenant}
+    -- ClickHouse cannot push the trace filter through LIMIT 1 BY, so keep every version of
+    -- each feedbackId that ever pointed at one of these traces. A rewrite can move a record
+    -- to another trace, and only its current version belongs in this page's summaries.
+    WHERE feedbackId IN (
+      SELECT feedbackId
+      FROM ${TABLE_FEEDBACK_EVENTS}
+      WHERE traceId IN ${ids}
+    )
     ORDER BY feedbackId, writeVersion DESC, timestamp DESC
     LIMIT 1 BY feedbackId
-  )
+  ) AS current
+  WHERE traceId IN ${ids}${tenant}
 )
 WHERE relatedRank <= ${parameters.add(relatedLimit, 'UInt64')}
 ORDER BY traceId ASC, relatedRank ASC`,
