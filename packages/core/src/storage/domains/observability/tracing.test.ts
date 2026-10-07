@@ -393,6 +393,8 @@ describe('buildOutputPreview', () => {
 
   it('falls back to compact JSON and previews empty or malformed output as empty', () => {
     expect(buildOutputPreview({ result: { ok: true } })).toBe('{"result":{"ok":true}}');
+    expect(buildOutputPreview([1, 2])).toBe('[1,2]');
+    expect(buildOutputPreview({ messages: [{ id: 'a' }] })).toBe('{"messages":[{"id":"a"}]}');
     expect(buildOutputPreview(null)).toBeUndefined();
     expect(buildOutputPreview('   ')).toBeUndefined();
     expect(buildOutputPreview('{"text":"cut off')).toBeUndefined();
