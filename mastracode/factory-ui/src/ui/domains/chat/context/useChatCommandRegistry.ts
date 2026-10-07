@@ -3,6 +3,7 @@ import {
   getAvailableThinkingLevelsForModel,
   parseThinkCommand,
   resolveDefaultThinkingLevel,
+  runThinkingLevel,
   THINK_COMMAND_DESCRIPTOR,
 } from '@mastra/code-sdk/thinking';
 import type { ThinkingLevelSetting, ThinkingLevelSource } from '@mastra/code-sdk/thinking';
@@ -73,6 +74,8 @@ export function useChatCommandRegistry(prefillComposer: (draft: string) => void)
   const { permissions, permissionsLoading, setPermissionForCategory } = useChatPermissions();
 
   const currentThinkingLevel = settingsQuery.data?.thinkingLevel;
+  const runningThinkingLevel =
+    currentThinkingLevel && runThinkingLevel(activeModelId ?? '', currentThinkingLevel, activeModelReasoningOptions);
   const thinkingLevelOptions: SlashCommandOption[] = [
     {
       value: 'default',
@@ -83,7 +86,7 @@ export function useChatCommandRegistry(prefillComposer: (draft: string) => void)
     ...availableThinkingLevels.map(level => ({
       value: level,
       label: THINKING_LEVEL_LABELS[level],
-      active: currentThinkingLevel === level,
+      active: runningThinkingLevel === level,
     })),
   ];
 
