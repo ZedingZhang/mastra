@@ -1,5 +1,36 @@
 # @mastra/react
 
+## 1.9.0-alpha.0
+
+### Minor Changes
+
+- Added `useTraceQueryDiscoveryAvailable`, which reports whether the observability store supports trace query field and value discovery. `useTraceMetadataFilterFields` now also returns `canonicalFields`, the store's built-in trace fields with their supported operators. ([#26212](https://github.com/mastra-ai/mastra/pull/26212))
+
+  ```tsx
+  import { useTraceQueryAvailable, useTraceQueryDiscoveryAvailable } from '@mastra/react/hooks/capabilities';
+  import { useTraceMetadataFilterFields } from '@mastra/react/hooks/traces';
+
+  function TraceFields({ timeRange }) {
+    const { enabled: withQueryTrace } = useTraceQueryAvailable();
+    const { enabled: withDiscovery } = useTraceQueryDiscoveryAvailable();
+
+    // Only call the discovery endpoint when the store supports both.
+    const { fields, canonicalFields } = useTraceMetadataFilterFields({
+      timeRange,
+      queryOptions: { enabled: withQueryTrace && withDiscovery },
+    });
+
+    const tags = canonicalFields.find(field => field.path === 'tags');
+    // tags?.operators → ['includes', 'notIncludes', 'exists', 'notExists']
+  }
+  ```
+
+### Patch Changes
+
+- Updated dependencies [[`956901a`](https://github.com/mastra-ai/mastra/commit/956901a36b84a85f3985d9e5956494749b7ea72c), [`956901a`](https://github.com/mastra-ai/mastra/commit/956901a36b84a85f3985d9e5956494749b7ea72c), [`1511a1d`](https://github.com/mastra-ai/mastra/commit/1511a1d65d9e2ccc08b4d6746f8e8053fc48549e), [`1511a1d`](https://github.com/mastra-ai/mastra/commit/1511a1d65d9e2ccc08b4d6746f8e8053fc48549e)]:
+  - @mastra/core@1.76.0-alpha.0
+  - @mastra/client-js@1.53.0-alpha.0
+
 ## 1.8.0
 
 ### Minor Changes

@@ -1,5 +1,18 @@
 # @mastra/client-js
 
+## 1.53.0-alpha.0
+
+### Minor Changes
+
+- Added the `matches` and `notMatches` trace-query operators to the generated trace-query types. ([#25111](https://github.com/mastra-ai/mastra/pull/25111))
+
+### Patch Changes
+
+- Fixed `tracingOptions.nestUnderParent` being dropped from agent and workflow requests sent over HTTP. A run started through `@mastra/client-js` with this option now stays a child of its parent run in the trace. ([#25691](https://github.com/mastra-ai/mastra/pull/25691))
+
+- Updated dependencies [[`956901a`](https://github.com/mastra-ai/mastra/commit/956901a36b84a85f3985d9e5956494749b7ea72c), [`1511a1d`](https://github.com/mastra-ai/mastra/commit/1511a1d65d9e2ccc08b4d6746f8e8053fc48549e)]:
+  - @mastra/core@1.76.0-alpha.0
+
 ## 1.52.0
 
 ### Minor Changes

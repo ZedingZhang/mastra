@@ -1,5 +1,20 @@
 # @mastra/playground-ui
 
+## 62.0.0-alpha.0
+
+### Patch Changes
+
+- Added "matches" and "does not match" to the Studio trace filters for span name and feedback comment, with a free-text value box for both operators. ([#25111](https://github.com/mastra-ai/mastra/pull/25111))
+
+- Added a Tags filter to the Traces list. When the observability store supports trace queries, you can filter traces by tags such as `production` or `manual-review`, exclude tags, or keep only traces that have (or lack) tags. Known tag values are suggested as you type. ([#26212](https://github.com/mastra-ai/mastra/pull/26212))
+
+  Fixed the Traces list showing "Failed to load traces" when a shared or hand-edited URL gave the feedback comment filter a text value. That filter only supports "exists" and "does not exist", so the invalid filter is now ignored instead.
+
+- Updated dependencies [[`956901a`](https://github.com/mastra-ai/mastra/commit/956901a36b84a85f3985d9e5956494749b7ea72c), [`956901a`](https://github.com/mastra-ai/mastra/commit/956901a36b84a85f3985d9e5956494749b7ea72c), [`b2919df`](https://github.com/mastra-ai/mastra/commit/b2919dfd85141a7abbcea3d17d37a3b2fd91227e), [`1511a1d`](https://github.com/mastra-ai/mastra/commit/1511a1d65d9e2ccc08b4d6746f8e8053fc48549e), [`1511a1d`](https://github.com/mastra-ai/mastra/commit/1511a1d65d9e2ccc08b4d6746f8e8053fc48549e)]:
+  - @mastra/core@1.76.0-alpha.0
+  - @mastra/client-js@1.53.0-alpha.0
+  - @mastra/react@1.9.0-alpha.0
+
 ## 61.0.0
 
 ### Minor Changes

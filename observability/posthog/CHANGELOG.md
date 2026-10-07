@@ -1,5 +1,26 @@
 # @mastra/posthog
 
+## 1.4.0-alpha.0
+
+### Minor Changes
+
+- Fixed `$ai_tools` in PostHog listing tools the model did not receive. Each call to the model provider is now exported as its own `$ai_generation` event with the model, token usage, output, the tools sent on that call, and the conversation that call received as `$ai_input` (including full tool arguments and results from earlier calls). ([#25919](https://github.com/mastra-ai/mastra/pull/25919))
+
+  **What changes in PostHog**
+
+  - A run that calls the model several times now sends one `$ai_generation` event per call, where it sent one per run before. The number of `$ai_generation` events goes up for multi-step runs.
+  - The span that wraps those calls is now sent as `$ai_span`. Tokens and cost are counted once, so total cost per trace does not change.
+  - Runs through the deprecated `generateLegacy()` and `streamLegacy()` methods no longer send `$ai_generation` events, so PostHog shows no tokens or cost for them. Use `generate()` and `stream()` instead.
+  - With `@mastra/core` or `@mastra/observability` versions that do not record a span per model call, events are exported as before.
+
+### Patch Changes
+
+- Fixed `$ai_input` in PostHog missing the results of provider-executed tools (for example a provider's web search). Each later call's `$ai_input` now includes those results, and failed ones are marked as errors. ([#26234](https://github.com/mastra-ai/mastra/pull/26234))
+
+- Updated dependencies [[`6df693a`](https://github.com/mastra-ai/mastra/commit/6df693aa926482422ef447d8db058adef36a594b), [`956901a`](https://github.com/mastra-ai/mastra/commit/956901a36b84a85f3985d9e5956494749b7ea72c), [`956901a`](https://github.com/mastra-ai/mastra/commit/956901a36b84a85f3985d9e5956494749b7ea72c), [`1511a1d`](https://github.com/mastra-ai/mastra/commit/1511a1d65d9e2ccc08b4d6746f8e8053fc48549e)]:
+  - @mastra/observability@1.19.0-alpha.0
+  - @mastra/core@1.76.0-alpha.0
+
 ## 1.3.16
 
 ### Patch Changes

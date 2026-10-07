@@ -191,5 +191,24 @@
     "@mastra/s3": "0.6.3",
     "@mastra/vercel": "1.6.0"
   },
-  "changesets": []
+  "changesets": [
+    "cold-games-accept",
+    "common-buckets-lead",
+    "cool-paths-feel",
+    "custom-board-pr-cards",
+    "many-hairs-appear",
+    "quick-flags-travel",
+    "smooth-dolls-find",
+    "strong-files-work",
+    "trace-query-discovery-hook",
+    "trace-query-text-matching-clickhouse",
+    "trace-query-text-matching-client-js",
+    "trace-query-text-matching-core",
+    "trace-query-text-matching-duckdb",
+    "trace-query-text-matching-pg",
+    "trace-query-text-matching-playground-ui",
+    "trace-tags-filter",
+    "wet-jobs-dress",
+    "wise-carrots-feel"
+  ]
 }

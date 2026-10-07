@@ -1,5 +1,24 @@
 # @mastra/observability
 
+## 1.19.0-alpha.0
+
+### Minor Changes
+
+- Added support for `tracingOptions.nestUnderParent`. Every span of a run started with this option, a `traceId`, and a `parentSpanId` is exported with `nestedUnderParent: true`, and the run's tags are no longer applied to the trace. Custom exporters can read this field to skip trace-level data for such runs. ([#25691](https://github.com/mastra-ai/mastra/pull/25691))
+
+  ```ts
+  await judge.generate('Grade this answer', {
+    tracingOptions: { traceId: turn.traceId, parentSpanId: turn.spanId, nestUnderParent: true },
+  });
+  ```
+
+### Patch Changes
+
+- Fixed Datadog APM dropping the whole trace when a span type is excluded with `excludeSpanTypes`. The bridge no longer starts a dd-trace span for excluded types, so the remaining spans finish and the trace is sent. Fixes [#25888](https://github.com/mastra-ai/mastra/issues/25888). ([#26044](https://github.com/mastra-ai/mastra/pull/26044))
+
+- Updated dependencies [[`956901a`](https://github.com/mastra-ai/mastra/commit/956901a36b84a85f3985d9e5956494749b7ea72c), [`1511a1d`](https://github.com/mastra-ai/mastra/commit/1511a1d65d9e2ccc08b4d6746f8e8053fc48549e)]:
+  - @mastra/core@1.76.0-alpha.0
+
 ## 1.18.4
 
 ### Patch Changes

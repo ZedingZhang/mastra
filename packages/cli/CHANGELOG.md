@@ -1,5 +1,17 @@
 # mastra
 
+## 1.33.1-alpha.0
+
+### Patch Changes
+
+- Fixed pull request and merge request cards not showing in the first column of a custom Factory board. These cards now appear there just as they do on the built-in Review board. Fixes [#26124](https://github.com/mastra-ai/mastra/issues/26124). ([#26156](https://github.com/mastra-ai/mastra/pull/26156))
+
+- Fixed Slack thread cards disappearing from the first column of custom Factory boards. ([#26230](https://github.com/mastra-ai/mastra/pull/26230))
+
+- Updated dependencies [[`956901a`](https://github.com/mastra-ai/mastra/commit/956901a36b84a85f3985d9e5956494749b7ea72c), [`1511a1d`](https://github.com/mastra-ai/mastra/commit/1511a1d65d9e2ccc08b4d6746f8e8053fc48549e)]:
+  - @mastra/core@1.76.0-alpha.0
+  - @mastra/deployer@1.76.0-alpha.0
+
 ## 1.33.0
 
 ### Minor Changes
